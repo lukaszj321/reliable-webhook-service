@@ -1,16 +1,24 @@
 # Reliable Webhook Delivery Service
 
-A Python service intended to provide reliable webhook delivery.
+A FastAPI service for reliable webhook ingestion and delivery.
 
 ## Current scope
 
 - Python 3.12 package foundation
-- Development tooling configuration
+- FastAPI application
+- GET /health endpoint
+- Automated health endpoint test
+- Ruff and mypy configuration
 
 ## Planned scope
 
-- FastAPI application and health endpoint
-- Reliable webhook ingestion, delivery, retry, and replay
+- Webhook endpoint configuration
+- Webhook event ingestion
+- Asynchronous delivery
+- Retry and backoff
+- Idempotency
+- Delivery attempt history
+- Manual replay
 
 ## Non-goals
 
@@ -32,4 +40,39 @@ Install the package with development dependencies:
 
 ```powershell
 python -m pip install -e ".[dev]"
+```
+
+## Run locally
+
+```powershell
+python -m uvicorn reliable_webhook_service.main:app --reload
+```
+
+The application will be available at:
+
+```text
+http://127.0.0.1:8000
+```
+
+## Health check
+
+```text
+GET /health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+## Quality checks
+
+```powershell
+python -m pytest -W error
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy src
 ```
