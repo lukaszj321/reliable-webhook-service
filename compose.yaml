@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:18.4
+    container_name: reliable-webhook-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-reliable_webhook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reliable_webhook}
+      POSTGRES_DB: ${POSTGRES_DB:-reliable_webhook}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres_data:
