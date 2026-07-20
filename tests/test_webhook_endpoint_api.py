@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from reliable_webhook_service.database import SessionFactory
 from reliable_webhook_service.main import app
@@ -76,3 +78,50 @@ def test_create_webhook_endpoint() -> None:
     assert endpoint_id is not None
     with SessionFactory() as session:
         assert session.get(WebhookEndpoint, endpoint_id) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "target_url"),
+    [
+        ("", "https://example.com/webhooks"),
+        ("   ", "https://example.com/webhooks"),
+        ("x" * 256, "https://example.com/webhooks"),
+        ("Invalid URL endpoint", "not-a-url"),
+        ("FTP endpoint", "ftp://example.com/webhooks"),
+        ("Long URL endpoint", "https://example.com/" + "a" * 2030),
+    ],
+    ids=[
+        "empty-name",
+        "whitespace-name",
+        "long-name",
+        "invalid-url",
+        "ftp-url",
+        "long-url",
+    ],
+)
+def test_reject_invalid_webhook_endpoint(name: str, target_url: str) -> None:
+    if name == "Long URL endpoint":
+        assert len(target_url) > 2048
+
+    with SessionFactory() as session:
+        endpoint_ids_before = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook-endpoints",
+            json={
+                "name": name,
+                "target_url": target_url,
+            },
+        )
+
+    assert response.status_code == 422
+
+    response_body = response.json()
+    assert "detail" in response_body
+    assert isinstance(response_body["detail"], list)
+
+    with SessionFactory() as session:
+        endpoint_ids_after = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    assert endpoint_ids_after == endpoint_ids_before
