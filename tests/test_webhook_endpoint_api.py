@@ -1,11 +1,13 @@
 import uuid
-from datetime import datetime
+from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
-from reliable_webhook_service.database import SessionFactory
+from reliable_webhook_service.database import SessionFactory, engine, get_session
 from reliable_webhook_service.main import app
 from reliable_webhook_service.models import WebhookEndpoint
 
@@ -125,3 +127,133 @@ def test_reject_invalid_webhook_endpoint(name: str, target_url: str) -> None:
         endpoint_ids_after = set(session.scalars(select(WebhookEndpoint.id)).all())
 
     assert endpoint_ids_after == endpoint_ids_before
+
+
+def test_list_webhook_endpoints_empty() -> None:
+    with SessionFactory() as session:
+        endpoint_ids_before = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        session = Session(bind=connection)
+
+        def override_get_session() -> Iterator[Session]:
+            yield session
+
+        app.dependency_overrides[get_session] = override_get_session
+
+        try:
+            session.execute(delete(WebhookEndpoint))
+            session.flush()
+
+            with TestClient(app) as client:
+                response = client.get("/webhook-endpoints")
+
+            assert response.status_code == 200
+            assert response.json() == []
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+            session.close()
+            if transaction.is_active:
+                transaction.rollback()
+
+    with SessionFactory() as session:
+        endpoint_ids_after = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    assert endpoint_ids_after == endpoint_ids_before
+
+
+def test_list_webhook_endpoints_in_deterministic_order() -> None:
+    controlled_ids = [
+        uuid.UUID("00000000-0000-0000-0000-000000000101"),
+        uuid.UUID("00000000-0000-0000-0000-000000000102"),
+        uuid.UUID("00000000-0000-0000-0000-000000000103"),
+    ]
+    marker = uuid.uuid4()
+    earlier = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    later = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
+    endpoints = [
+        WebhookEndpoint(
+            id=controlled_ids[0],
+            name=f"Listing endpoint 101 {marker}",
+            target_url=f"https://example.com/webhooks/{marker}/101",
+            is_active=True,
+            created_at=earlier,
+            updated_at=earlier,
+        ),
+        WebhookEndpoint(
+            id=controlled_ids[1],
+            name=f"Listing endpoint 102 {marker}",
+            target_url=f"https://example.com/webhooks/{marker}/102",
+            is_active=True,
+            created_at=earlier,
+            updated_at=earlier,
+        ),
+        WebhookEndpoint(
+            id=controlled_ids[2],
+            name=f"Listing endpoint 103 {marker}",
+            target_url=f"https://example.com/webhooks/{marker}/103",
+            is_active=True,
+            created_at=later,
+            updated_at=later,
+        ),
+    ]
+    expected_by_id = {str(endpoint.id): endpoint for endpoint in endpoints}
+    expected_order = [str(endpoint_id) for endpoint_id in controlled_ids]
+
+    with SessionFactory() as session:
+        assert all(
+            session.get(WebhookEndpoint, endpoint_id) is None for endpoint_id in controlled_ids
+        )
+
+    try:
+        with SessionFactory() as session:
+            session.add_all(endpoints)
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.get("/webhook-endpoints")
+
+        assert response.status_code == 200
+
+        response_body = response.json()
+        assert isinstance(response_body, list)
+
+        controlled_items = [item for item in response_body if item["id"] in expected_by_id]
+        assert len(controlled_items) == 3
+        assert [item["id"] for item in controlled_items] == expected_order
+
+        for item in controlled_items:
+            assert set(item) == {
+                "id",
+                "name",
+                "target_url",
+                "is_active",
+                "created_at",
+                "updated_at",
+            }
+
+            endpoint_id = uuid.UUID(item["id"])
+            expected_endpoint = expected_by_id[str(endpoint_id)]
+            assert item["name"] == expected_endpoint.name
+            assert item["target_url"] == expected_endpoint.target_url
+            assert item["is_active"] is True
+
+            created_at = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+            updated_at = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00"))
+            assert created_at.tzinfo is not None
+            assert created_at.utcoffset() is not None
+            assert updated_at.tzinfo is not None
+            assert updated_at.utcoffset() is not None
+    finally:
+        with SessionFactory() as session:
+            for endpoint_id in controlled_ids:
+                stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+                if stored_endpoint is not None:
+                    session.delete(stored_endpoint)
+            session.commit()
+
+    with SessionFactory() as session:
+        assert all(
+            session.get(WebhookEndpoint, endpoint_id) is None for endpoint_id in controlled_ids
+        )
