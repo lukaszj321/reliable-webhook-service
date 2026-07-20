@@ -3,6 +3,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+# Import model definitions so SQLAlchemy registers them on Base.metadata.
+import reliable_webhook_service.models  # noqa: F401
 from reliable_webhook_service.config import Settings
 from reliable_webhook_service.database import Base
 
