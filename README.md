@@ -19,6 +19,10 @@ A FastAPI service for reliable webhook ingestion and delivery.
 - First Alembic schema revision
 - Migration upgrade/downgrade test
 - Webhook endpoint persistence test
+- Webhook endpoint creation API
+- Webhook endpoint listing API
+- Pydantic request and response validation
+- Real PostgreSQL API integration tests
 
 ## Planned scope
 
@@ -143,11 +147,75 @@ Expected response:
 }
 ```
 
+## Webhook endpoint API
+
+### Create a webhook endpoint
+
+```text
+POST /webhook-endpoints
+```
+
+Creates a webhook destination configuration and returns HTTP 201.
+
+Example request:
+
+```json
+{
+  "name": "Primary webhook endpoint",
+  "target_url": "https://example.com/webhooks"
+}
+```
+
+Example response:
+
+```json
+{
+  "id": "5dce6a1d-f4c7-4c16-b709-2b0d08683ed2",
+  "name": "Primary webhook endpoint",
+  "target_url": "https://example.com/webhooks",
+  "is_active": true,
+  "created_at": "2026-07-20T20:00:00Z",
+  "updated_at": "2026-07-20T20:00:00Z"
+}
+```
+
+- Leading and trailing whitespace is trimmed from `name`.
+- After trimming, `name` must contain between 1 and 255 characters.
+- `target_url` must be a valid HTTP or HTTPS URL and may contain at most 2048 characters.
+- Invalid request data returns HTTP 422.
+- `id`, `is_active`, `created_at`, and `updated_at` are set by the application or database.
+
+### List webhook endpoints
+
+```text
+GET /webhook-endpoints
+```
+
+Returns HTTP 200 with an array of all stored webhook endpoint configurations. The response is an
+empty array when no records exist. Results are sorted by `created_at` ascending and then by `id`
+ascending. Pagination is not currently supported.
+
+Example response:
+
+```json
+[
+  {
+    "id": "5dce6a1d-f4c7-4c16-b709-2b0d08683ed2",
+    "name": "Primary webhook endpoint",
+    "target_url": "https://example.com/webhooks",
+    "is_active": true,
+    "created_at": "2026-07-20T20:00:00Z",
+    "updated_at": "2026-07-20T20:00:00Z"
+  }
+]
+```
+
 ## Quality checks
 
 The full test suite requires a running PostgreSQL service.
 It covers PostgreSQL connectivity, the health endpoint, the migration upgrade/downgrade cycle,
-and `WebhookEndpoint` persistence.
+`WebhookEndpoint` persistence, endpoint creation through the API, invalid request rejection,
+empty listing responses, and deterministic ordering of stored endpoints against real PostgreSQL.
 
 ```powershell
 python -m pytest -W error

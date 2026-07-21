@@ -1,0 +1,259 @@
+import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
+
+from reliable_webhook_service.database import SessionFactory, engine, get_session
+from reliable_webhook_service.main import app
+from reliable_webhook_service.models import WebhookEndpoint
+
+
+def test_create_webhook_endpoint() -> None:
+    marker = uuid.uuid4()
+    expected_name = f"API test endpoint {marker}"
+    request_name = f"  {expected_name}  "
+    expected_target_url = f"https://example.com/webhooks/{marker}"
+    endpoint_id: uuid.UUID | None = None
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/webhook-endpoints",
+                json={
+                    "name": request_name,
+                    "target_url": expected_target_url,
+                },
+            )
+
+        assert response.status_code == 201
+
+        response_body = response.json()
+        assert set(response_body) == {
+            "id",
+            "name",
+            "target_url",
+            "is_active",
+            "created_at",
+            "updated_at",
+        }
+
+        endpoint_id = uuid.UUID(response_body["id"])
+        assert response_body["name"] == expected_name
+        assert isinstance(response_body["target_url"], str)
+        assert response_body["target_url"] == expected_target_url
+        assert response_body["is_active"] is True
+
+        created_at = datetime.fromisoformat(response_body["created_at"].replace("Z", "+00:00"))
+        updated_at = datetime.fromisoformat(response_body["updated_at"].replace("Z", "+00:00"))
+        assert created_at.tzinfo is not None
+        assert created_at.utcoffset() is not None
+        assert updated_at.tzinfo is not None
+        assert updated_at.utcoffset() is not None
+        assert updated_at >= created_at
+
+        with SessionFactory() as session:
+            stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+
+            assert stored_endpoint is not None
+            assert stored_endpoint.id == endpoint_id
+            assert stored_endpoint.name == expected_name
+            assert stored_endpoint.target_url == response_body["target_url"]
+            assert stored_endpoint.is_active is True
+            assert stored_endpoint.created_at is not None
+            assert stored_endpoint.updated_at is not None
+            assert stored_endpoint.created_at.tzinfo is not None
+            assert stored_endpoint.created_at.utcoffset() is not None
+            assert stored_endpoint.updated_at.tzinfo is not None
+            assert stored_endpoint.updated_at.utcoffset() is not None
+    finally:
+        if endpoint_id is not None:
+            with SessionFactory() as session:
+                stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+                if stored_endpoint is not None:
+                    session.delete(stored_endpoint)
+                    session.commit()
+
+    assert endpoint_id is not None
+    with SessionFactory() as session:
+        assert session.get(WebhookEndpoint, endpoint_id) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "target_url"),
+    [
+        ("", "https://example.com/webhooks"),
+        ("   ", "https://example.com/webhooks"),
+        ("x" * 256, "https://example.com/webhooks"),
+        ("Invalid URL endpoint", "not-a-url"),
+        ("FTP endpoint", "ftp://example.com/webhooks"),
+        ("Long URL endpoint", "https://example.com/" + "a" * 2030),
+    ],
+    ids=[
+        "empty-name",
+        "whitespace-name",
+        "long-name",
+        "invalid-url",
+        "ftp-url",
+        "long-url",
+    ],
+)
+def test_reject_invalid_webhook_endpoint(name: str, target_url: str) -> None:
+    if name == "Long URL endpoint":
+        assert len(target_url) > 2048
+
+    with SessionFactory() as session:
+        endpoint_ids_before = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook-endpoints",
+            json={
+                "name": name,
+                "target_url": target_url,
+            },
+        )
+
+    assert response.status_code == 422
+
+    response_body = response.json()
+    assert "detail" in response_body
+    assert isinstance(response_body["detail"], list)
+
+    with SessionFactory() as session:
+        endpoint_ids_after = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    assert endpoint_ids_after == endpoint_ids_before
+
+
+def test_list_webhook_endpoints_empty() -> None:
+    with SessionFactory() as session:
+        endpoint_ids_before = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        session = Session(bind=connection)
+
+        def override_get_session() -> Iterator[Session]:
+            yield session
+
+        app.dependency_overrides[get_session] = override_get_session
+
+        try:
+            session.execute(delete(WebhookEndpoint))
+            session.flush()
+
+            with TestClient(app) as client:
+                response = client.get("/webhook-endpoints")
+
+            assert response.status_code == 200
+            assert response.json() == []
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+            session.close()
+            if transaction.is_active:
+                transaction.rollback()
+
+    with SessionFactory() as session:
+        endpoint_ids_after = set(session.scalars(select(WebhookEndpoint.id)).all())
+
+    assert endpoint_ids_after == endpoint_ids_before
+
+
+def test_list_webhook_endpoints_in_deterministic_order() -> None:
+    controlled_ids = [
+        uuid.UUID("00000000-0000-0000-0000-000000000101"),
+        uuid.UUID("00000000-0000-0000-0000-000000000102"),
+        uuid.UUID("00000000-0000-0000-0000-000000000103"),
+    ]
+    marker = uuid.uuid4()
+    earlier = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    later = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
+    endpoints = [
+        WebhookEndpoint(
+            id=controlled_ids[0],
+            name=f"Listing endpoint 101 {marker}",
+            target_url=f"https://example.com/webhooks/{marker}/101",
+            is_active=True,
+            created_at=earlier,
+            updated_at=earlier,
+        ),
+        WebhookEndpoint(
+            id=controlled_ids[1],
+            name=f"Listing endpoint 102 {marker}",
+            target_url=f"https://example.com/webhooks/{marker}/102",
+            is_active=True,
+            created_at=earlier,
+            updated_at=earlier,
+        ),
+        WebhookEndpoint(
+            id=controlled_ids[2],
+            name=f"Listing endpoint 103 {marker}",
+            target_url=f"https://example.com/webhooks/{marker}/103",
+            is_active=True,
+            created_at=later,
+            updated_at=later,
+        ),
+    ]
+    expected_by_id = {str(endpoint.id): endpoint for endpoint in endpoints}
+    expected_order = [str(endpoint_id) for endpoint_id in controlled_ids]
+
+    with SessionFactory() as session:
+        assert all(
+            session.get(WebhookEndpoint, endpoint_id) is None for endpoint_id in controlled_ids
+        )
+
+    try:
+        with SessionFactory() as session:
+            session.add_all(endpoints)
+            session.commit()
+
+        with TestClient(app) as client:
+            response = client.get("/webhook-endpoints")
+
+        assert response.status_code == 200
+
+        response_body = response.json()
+        assert isinstance(response_body, list)
+
+        controlled_items = [item for item in response_body if item["id"] in expected_by_id]
+        assert len(controlled_items) == 3
+        assert [item["id"] for item in controlled_items] == expected_order
+
+        for item in controlled_items:
+            assert set(item) == {
+                "id",
+                "name",
+                "target_url",
+                "is_active",
+                "created_at",
+                "updated_at",
+            }
+
+            endpoint_id = uuid.UUID(item["id"])
+            expected_endpoint = expected_by_id[str(endpoint_id)]
+            assert item["name"] == expected_endpoint.name
+            assert item["target_url"] == expected_endpoint.target_url
+            assert item["is_active"] is True
+
+            created_at = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+            updated_at = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00"))
+            assert created_at.tzinfo is not None
+            assert created_at.utcoffset() is not None
+            assert updated_at.tzinfo is not None
+            assert updated_at.utcoffset() is not None
+    finally:
+        with SessionFactory() as session:
+            for endpoint_id in controlled_ids:
+                stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+                if stored_endpoint is not None:
+                    session.delete(stored_endpoint)
+            session.commit()
+
+    with SessionFactory() as session:
+        assert all(
+            session.get(WebhookEndpoint, endpoint_id) is None for endpoint_id in controlled_ids
+        )
