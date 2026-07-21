@@ -7,10 +7,13 @@ This documentation explains how to develop and validate Reliable Webhook Deliver
 Start with the local development guide:
 
 1. [Development setup](development.md)
+2. [Database and migrations](database.md)
 
 ## Documentation map
 
 - [Development setup](development.md) — install, configure, run, and validate the project locally.
+- [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
+  migrations, and the current database schema.
 
 ## Common tasks
 
@@ -21,6 +24,9 @@ Start with the local development guide:
 - [Run the application](development.md#run-the-application)
 - [Run quality checks](development.md#quality-checks)
 - [Stop PostgreSQL](development.md#stop-postgresql)
+- [Review database connection configuration](database.md#connection-configuration)
+- [Apply or inspect migrations](database.md#alembic-migrations)
+- [Review the current database schema](database.md#database-schema)
 
 ## Navigation
 
