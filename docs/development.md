@@ -87,7 +87,7 @@ After PostgreSQL is healthy, upgrade the database to the latest revision:
 python -m alembic upgrade head
 ```
 
-Detailed migration and schema documentation will be available in the database guide.
+See [Database and migrations](database.md) for detailed migration and schema documentation.
 
 ## Run the application
 
