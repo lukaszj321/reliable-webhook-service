@@ -103,7 +103,8 @@ through SQLAlchemy's ORM configuration.
 
 The ORM model stores `target_url` as a string and does not validate URL syntax. API requests are
 validated separately by Pydantic and accept only HTTP or HTTPS URLs with a maximum length of 2048
-characters. Code that uses the ORM model directly bypasses this API validation.
+characters. Code that uses the ORM model directly bypasses this API validation. See
+[Request validation](api/webhook-endpoints.md#request-validation) for the public API rules.
 
 ## Navigation
 
