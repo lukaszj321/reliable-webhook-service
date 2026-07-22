@@ -2,7 +2,7 @@
 
 A FastAPI service being developed toward reliable webhook ingestion and delivery.
 
-[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md)
+[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md)
 
 ## Table of contents
 
@@ -22,12 +22,11 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - PostgreSQL persistence through synchronous SQLAlchemy sessions
 - Alembic migrations and a Docker Compose PostgreSQL service
 - `WebhookEndpoint` ORM model and `webhook_endpoints` table
-- `WebhookEvent` ORM model
-- `webhook_events` PostgreSQL table
-- JSONB webhook event payload persistence
-- Foreign key from webhook events to webhook endpoints
 - `POST /webhook-endpoints` and `GET /webhook-endpoints`
-- Pydantic request and response validation
+- Webhook event creation API through `POST /webhook-events`
+- Pydantic request validation for webhook events
+- PostgreSQL JSONB persistence linked to an existing `WebhookEndpoint`
+- HTTP 404 response when the referenced webhook endpoint does not exist
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
 
@@ -35,8 +34,7 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 
 The following capabilities are planned but are not currently implemented:
 
-- Webhook event ingestion
-- Asynchronous delivery
+- Asynchronous delivery processing
 - Retry and backoff
 - Idempotency
 - Delivery attempt history
@@ -58,7 +56,13 @@ flowchart LR
     App --> Router["Webhook endpoint router<br/>POST and GET /webhook-endpoints"]
     Router -->|"validates POST request"| Validation["Pydantic validation"]
     Router --> Session["SQLAlchemy session"]
-    Session --> PostgreSQL["PostgreSQL"]
+    Session --> Endpoint["WebhookEndpoint"]
+    Endpoint --> PostgreSQL["PostgreSQL"]
+    App --> EventAPI["FastAPI<br/>POST /webhook-events"]
+    EventAPI -->|"validates request"| EventValidation["Pydantic validation"]
+    EventAPI --> Session
+    Session --> Event["WebhookEvent"]
+    Event --> PostgreSQL
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -104,8 +108,9 @@ See the [Development setup guide](docs/development.md) for environment configura
 | GET | `/health` | Check application availability |
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
+| POST | `/webhook-events` | Store an event for an existing webhook endpoint |
 
-[API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md)
+[API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md)
 
 ## Quality checks
 
@@ -130,3 +135,4 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, and ORM behavior |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
+| [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |

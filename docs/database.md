@@ -98,7 +98,7 @@ The `webhook_endpoints` table stores configurations for webhook destination addr
 ### webhook_events
 
 The `webhook_events` table stores events associated with an existing webhook endpoint
-configuration. Persistence of these records does not provide webhook ingestion or delivery.
+configuration. Persistence of these records does not provide webhook delivery.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -141,8 +141,10 @@ through SQLAlchemy's ORM configuration.
 - The payload is stored as PostgreSQL `JSONB`.
 - The model has no `updated_at` column and no ORM relationship with `WebhookEndpoint`.
 - The foreign key does not provide cascade delete.
-- Alembic manages the `webhook_events` schema. No API route currently persists `WebhookEvent`
-  objects.
+- `POST /webhook-events` verifies the referenced endpoint and persists a `WebhookEvent` object.
+- An inactive endpoint can still accept an event through the creation API.
+- Alembic manages the `webhook_events` schema. The event creation API uses the existing schema, so
+  Issue #13 adds no migration and the current Alembic head remains `df51b920cf81`.
 
 **Shared persistence configuration**
 
@@ -156,9 +158,14 @@ validated separately by Pydantic and accept only HTTP or HTTPS URLs with a maxim
 characters. Code that uses the ORM model directly bypasses this API validation. See
 [Request validation](api/webhook-endpoints.md#request-validation) for the public API rules.
 
-`WebhookEvent` is currently only a persistence model. There are no public event request or response
-schemas, and neither `POST /webhook-events` nor `GET /webhook-events` exists. Payload format and size
-are not yet validated by a public API; webhook event ingestion remains planned scope.
+`WebhookEventCreate` and `WebhookEventResponse` define the public event request and response.
+`POST /webhook-events` requires `endpoint_id` to be the UUID of an existing endpoint, trims
+`event_type` to between 1 and 255 characters, and requires `payload` to be a top-level JSON object.
+The payload is stored as PostgreSQL `JSONB`. Nested objects, lists, JSON scalars, and `null` are
+supported within the object, but no payload size limit or event-specific schema is configured.
+Inactive endpoints can accept events. The API does not deliver events, create delivery attempts, or
+provide retry or replay behavior. See [Webhook event API](api/webhook-events.md) for the complete
+request and response behavior.
 
 ## Navigation
 

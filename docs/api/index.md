@@ -6,6 +6,7 @@ This documentation describes the HTTP endpoints currently available in the FastA
 
 - Health check
 - [Webhook endpoint configuration](webhook-endpoints.md)
+- [Webhook event API](webhook-events.md)
 
 ## Health check
 
@@ -32,6 +33,14 @@ Available routes:
 
 See [Webhook endpoint API](webhook-endpoints.md) for request, response, and validation details.
 
+## Webhook event API
+
+`POST /webhook-events` validates a webhook event request and stores the event in PostgreSQL for an
+existing webhook endpoint. A request that references a missing endpoint returns HTTP 404.
+
+See [Webhook event API](webhook-events.md) for request, response, validation, persistence, and error
+details.
+
 ## Interactive documentation
 
 FastAPI exposes interactive API documentation when the application is running locally:
@@ -42,6 +51,7 @@ FastAPI exposes interactive API documentation when the application is running lo
 ## Navigation
 
 - [Webhook endpoint API](webhook-endpoints.md)
+- [Webhook event API](webhook-events.md)
 - [Documentation index](../index.md)
 - [Development setup](../development.md)
 - [Project README](../../README.md)
