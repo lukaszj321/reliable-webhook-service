@@ -1,6 +1,9 @@
 import uuid
 from datetime import datetime
 
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from reliable_webhook_service.database import SessionFactory
 from reliable_webhook_service.models import JsonValue, WebhookEndpoint, WebhookEvent
 
@@ -122,3 +125,89 @@ def test_webhook_event_persistence() -> None:
     with SessionFactory() as session:
         assert all(session.get(WebhookEvent, event_id) is None for event_id in event_ids)
         assert session.get(WebhookEndpoint, endpoint_id) is None
+
+
+def test_webhook_event_requires_existing_endpoint() -> None:
+    missing_endpoint_id = uuid.uuid4()
+    invalid_event_id = uuid.uuid4()
+    payload: dict[str, JsonValue] = {"source": "foreign-key-test"}
+
+    with SessionFactory() as session:
+        invalid_event = WebhookEvent(
+            id=invalid_event_id,
+            endpoint_id=missing_endpoint_id,
+            event_type="invalid.endpoint",
+            payload=payload,
+        )
+        session.add(invalid_event)
+
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    with SessionFactory() as session:
+        assert session.get(WebhookEvent, invalid_event_id) is None
+        assert session.get(WebhookEndpoint, missing_endpoint_id) is None
+
+
+def test_webhook_endpoint_with_events_cannot_be_deleted() -> None:
+    endpoint_id: uuid.UUID | None = None
+    event_id: uuid.UUID | None = None
+    payload: dict[str, JsonValue] = {"protected": True}
+
+    try:
+        with SessionFactory() as session:
+            endpoint = WebhookEndpoint(
+                name="Protected webhook endpoint",
+                target_url="https://example.com/protected-webhook",
+            )
+            session.add(endpoint)
+            session.commit()
+            session.refresh(endpoint)
+            endpoint_id = endpoint.id
+
+            event = WebhookEvent(
+                endpoint_id=endpoint_id,
+                event_type="endpoint.protected",
+                payload=payload,
+            )
+            session.add(event)
+            session.commit()
+            session.refresh(event)
+            event_id = event.id
+
+        with SessionFactory() as session:
+            stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+            assert stored_endpoint is not None
+            session.delete(stored_endpoint)
+
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
+        with SessionFactory() as session:
+            stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+            stored_event = session.get(WebhookEvent, event_id)
+
+            assert stored_endpoint is not None
+            assert stored_event is not None
+            assert stored_event.endpoint_id == endpoint_id
+    finally:
+        with SessionFactory() as session:
+            if event_id is not None:
+                stored_event = session.get(WebhookEvent, event_id)
+                if stored_event is not None:
+                    session.delete(stored_event)
+            session.commit()
+
+            if endpoint_id is not None:
+                stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+                if stored_endpoint is not None:
+                    session.delete(stored_endpoint)
+            session.commit()
+
+    with SessionFactory() as session:
+        if event_id is not None:
+            assert session.get(WebhookEvent, event_id) is None
+        if endpoint_id is not None:
+            assert session.get(WebhookEndpoint, endpoint_id) is None
