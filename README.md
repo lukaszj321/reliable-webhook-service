@@ -22,6 +22,10 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - PostgreSQL persistence through synchronous SQLAlchemy sessions
 - Alembic migrations and a Docker Compose PostgreSQL service
 - `WebhookEndpoint` ORM model and `webhook_endpoints` table
+- `WebhookEvent` ORM model
+- `webhook_events` PostgreSQL table
+- JSONB webhook event payload persistence
+- Foreign key from webhook events to webhook endpoints
 - `POST /webhook-endpoints` and `GET /webhook-endpoints`
 - Pydantic request and response validation
 - Integration tests against real PostgreSQL
