@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from reliable_webhook_service.database import SessionFactory
 from reliable_webhook_service.main import app
@@ -122,3 +124,148 @@ def test_create_webhook_event() -> None:
     with SessionFactory() as session:
         assert session.get(WebhookEvent, event_id) is None
         assert session.get(WebhookEndpoint, endpoint_id) is None
+
+
+@pytest.mark.parametrize(
+    ("request_body", "expected_field"),
+    [
+        (
+            {
+                "endpoint_id": "not-a-uuid",
+                "event_type": "order.created",
+                "payload": {},
+            },
+            "endpoint_id",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "",
+                "payload": {},
+            },
+            "event_type",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "   ",
+                "payload": {},
+            },
+            "event_type",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "x" * 256,
+                "payload": {},
+            },
+            "event_type",
+        ),
+        (
+            {
+                "event_type": "order.created",
+                "payload": {},
+            },
+            "endpoint_id",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "payload": {},
+            },
+            "event_type",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+            },
+            "payload",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+                "payload": [],
+            },
+            "payload",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+                "payload": "invalid",
+            },
+            "payload",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+                "payload": 42,
+            },
+            "payload",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+                "payload": 3.14,
+            },
+            "payload",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+                "payload": True,
+            },
+            "payload",
+        ),
+        (
+            {
+                "endpoint_id": str(uuid.uuid4()),
+                "event_type": "order.created",
+                "payload": None,
+            },
+            "payload",
+        ),
+    ],
+    ids=[
+        "malformed-endpoint-id",
+        "empty-event-type",
+        "whitespace-event-type",
+        "long-event-type",
+        "missing-endpoint-id",
+        "missing-event-type",
+        "missing-payload",
+        "top-level-payload-list",
+        "top-level-payload-string",
+        "top-level-payload-int",
+        "top-level-payload-float",
+        "top-level-payload-bool",
+        "top-level-payload-null",
+    ],
+)
+def test_reject_invalid_webhook_event_request(
+    request_body: dict[str, JsonValue],
+    expected_field: str,
+) -> None:
+    with SessionFactory() as session:
+        event_ids_before = set(session.scalars(select(WebhookEvent.id)).all())
+
+    with TestClient(app) as client:
+        response = client.post("/webhook-events", json=request_body)
+
+    assert response.status_code == 422
+
+    response_body = response.json()
+    assert "detail" in response_body
+    assert isinstance(response_body["detail"], list)
+    assert response_body["detail"]
+    assert any(error["loc"][-1] == expected_field for error in response_body["detail"])
+
+    with SessionFactory() as session:
+        event_ids_after = set(session.scalars(select(WebhookEvent.id)).all())
+
+    assert event_ids_after == event_ids_before
