@@ -269,3 +269,38 @@ def test_reject_invalid_webhook_event_request(
         event_ids_after = set(session.scalars(select(WebhookEvent.id)).all())
 
     assert event_ids_after == event_ids_before
+
+
+def test_reject_webhook_event_for_missing_endpoint() -> None:
+    missing_endpoint_id = uuid.uuid4()
+    payload: dict[str, JsonValue] = {
+        "source": "missing-endpoint-test",
+        "nested": {
+            "valid": True,
+            "value": None,
+        },
+    }
+
+    with SessionFactory() as session:
+        assert session.get(WebhookEndpoint, missing_endpoint_id) is None
+        event_ids_before = set(session.scalars(select(WebhookEvent.id)).all())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook-events",
+            json={
+                "endpoint_id": str(missing_endpoint_id),
+                "event_type": "order.created",
+                "payload": payload,
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Webhook endpoint not found"}
+
+    with SessionFactory() as session:
+        event_ids_after = set(session.scalars(select(WebhookEvent.id)).all())
+
+        assert event_ids_after == event_ids_before
+        assert session.get(WebhookEndpoint, missing_endpoint_id) is None
+        assert set(session.scalars(select(WebhookEvent.id)).all()) == event_ids_after
