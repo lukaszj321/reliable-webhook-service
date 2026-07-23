@@ -428,3 +428,132 @@ def test_reject_duplicate_delivery_attempt_number() -> None:
         assert session.get(WebhookDeliveryAttempt, first_attempt_id) is None
         assert session.get(WebhookEvent, event_id) is None
         assert session.get(WebhookEndpoint, endpoint_id) is None
+
+
+def test_webhook_event_delete_blocked_by_delivery_attempt() -> None:
+    marker = uuid.uuid4()
+    endpoint_id: uuid.UUID | None = None
+    event_id: uuid.UUID | None = None
+    attempt_id: uuid.UUID | None = None
+    target_url = f"https://example.com/delivery-fk/{marker}"
+    payload: dict[str, JsonValue] = {
+        "marker": str(marker),
+        "foreign_key_test": True,
+    }
+
+    try:
+        with SessionFactory() as session:
+            endpoint = WebhookEndpoint(
+                name=f"Delivery attempt foreign key {marker}",
+                target_url=target_url,
+                is_active=True,
+            )
+            session.add(endpoint)
+            session.flush()
+            endpoint_id = endpoint.id
+
+            assert isinstance(endpoint_id, uuid.UUID)
+
+            event = WebhookEvent(
+                endpoint_id=endpoint_id,
+                event_type="delivery.foreign-key.test",
+                payload=payload,
+            )
+            session.add(event)
+            session.flush()
+            event_id = event.id
+
+            assert isinstance(event_id, uuid.UUID)
+
+            attempt = WebhookDeliveryAttempt(
+                event_id=event_id,
+                attempt_number=1,
+                outcome="failed",
+                target_url=target_url,
+                response_status_code=None,
+                error_message="Foreign key delete behavior",
+                duration_ms=10,
+            )
+            session.add(attempt)
+            session.commit()
+            session.refresh(attempt)
+            attempt_id = attempt.id
+
+            assert isinstance(attempt_id, uuid.UUID)
+
+        with SessionFactory() as session:
+            stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+            stored_event = session.get(WebhookEvent, event_id)
+            stored_attempt = session.get(WebhookDeliveryAttempt, attempt_id)
+
+            assert stored_endpoint is not None
+            assert stored_event is not None
+            assert stored_attempt is not None
+
+            session.delete(stored_event)
+
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
+            attempt_ids = set(session.scalars(select(WebhookDeliveryAttempt.id)).all())
+            assert attempt_id in attempt_ids
+            assert session.get(WebhookDeliveryAttempt, attempt_id) is not None
+            assert session.get(WebhookEvent, event_id) is not None
+            assert session.get(WebhookEndpoint, endpoint_id) is not None
+
+            stored_attempt = session.get(WebhookDeliveryAttempt, attempt_id)
+            assert stored_attempt is not None
+            session.delete(stored_attempt)
+            session.commit()
+
+            assert session.get(WebhookDeliveryAttempt, attempt_id) is None
+            assert session.get(WebhookEvent, event_id) is not None
+            assert session.get(WebhookEndpoint, endpoint_id) is not None
+
+            stored_event = session.get(WebhookEvent, event_id)
+            assert stored_event is not None
+            session.delete(stored_event)
+            session.commit()
+
+            assert session.get(WebhookEvent, event_id) is None
+            assert session.get(WebhookEndpoint, endpoint_id) is not None
+
+            stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+            assert stored_endpoint is not None
+            session.delete(stored_endpoint)
+            session.commit()
+
+        with SessionFactory() as session:
+            assert session.get(WebhookDeliveryAttempt, attempt_id) is None
+            assert session.get(WebhookEvent, event_id) is None
+            assert session.get(WebhookEndpoint, endpoint_id) is None
+    finally:
+        with SessionFactory() as session:
+            session.rollback()
+
+            if attempt_id is not None:
+                stored_attempt = session.get(WebhookDeliveryAttempt, attempt_id)
+                if stored_attempt is not None:
+                    session.delete(stored_attempt)
+            session.commit()
+
+            if event_id is not None:
+                stored_event = session.get(WebhookEvent, event_id)
+                if stored_event is not None:
+                    session.delete(stored_event)
+            session.commit()
+
+            if endpoint_id is not None:
+                stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+                if stored_endpoint is not None:
+                    session.delete(stored_endpoint)
+            session.commit()
+
+    assert attempt_id is not None
+    assert event_id is not None
+    assert endpoint_id is not None
+    with SessionFactory() as session:
+        assert session.get(WebhookDeliveryAttempt, attempt_id) is None
+        assert session.get(WebhookEvent, event_id) is None
+        assert session.get(WebhookEndpoint, endpoint_id) is None
