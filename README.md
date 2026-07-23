@@ -27,6 +27,10 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Pydantic request validation for webhook events
 - PostgreSQL JSONB persistence linked to an existing `WebhookEndpoint`
 - HTTP 404 response when the referenced webhook endpoint does not exist
+- `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
+- Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
+- PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
+- ORM code can store completed attempts; the current API does not create them automatically
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
 
@@ -37,7 +41,7 @@ The following capabilities are planned but are not currently implemented:
 - Asynchronous delivery processing
 - Retry and backoff
 - Idempotency
-- Delivery attempt history
+- Automatic delivery attempt recording and inspection
 - Manual replay
 
 ## Non-goals
