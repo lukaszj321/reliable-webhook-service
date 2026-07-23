@@ -140,7 +140,8 @@ details.
 
 ## Non-goals and current limitations
 
-- Event listing and `GET /webhook-events` are not available.
+- General event listing through `GET /webhook-events` is not available. The only read operation
+  nested under an event is the delivery attempt listing for one existing event.
 - Event delivery is not implemented.
 - Retry, idempotency, and replay are not implemented.
 - No payload size limit is configured.
@@ -149,6 +150,7 @@ details.
 ## Navigation
 
 - [API documentation index](index.md)
+- [Webhook delivery attempt API](webhook-delivery-attempts.md)
 - [Main documentation index](../index.md)
 - [Database and migrations](../database.md)
 - [Project README](../../README.md)

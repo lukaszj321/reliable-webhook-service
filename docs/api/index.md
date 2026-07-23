@@ -7,6 +7,7 @@ This documentation describes the HTTP endpoints currently available in the FastA
 - Health check
 - [Webhook endpoint configuration](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
+- [Webhook delivery attempt API](webhook-delivery-attempts.md)
 
 ## Health check
 
@@ -41,6 +42,15 @@ existing webhook endpoint. A request that references a missing endpoint returns 
 See [Webhook event API](webhook-events.md) for request, response, validation, persistence, and error
 details.
 
+## Webhook delivery attempt API
+
+`GET /webhook-events/{event_id}/delivery-attempts` reads stored completed delivery attempts for one
+existing event. It returns an empty list when the event has no attempts and HTTP 404 when the event
+does not exist. The endpoint does not create attempts automatically.
+
+See [Webhook delivery attempt API](webhook-delivery-attempts.md) for response fields, ordering,
+empty results, errors, and read-only behavior.
+
 ## Interactive documentation
 
 FastAPI exposes interactive API documentation when the application is running locally:
@@ -52,6 +62,7 @@ FastAPI exposes interactive API documentation when the application is running lo
 
 - [Webhook endpoint API](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
+- [Webhook delivery attempt API](webhook-delivery-attempts.md)
 - [Documentation index](../index.md)
 - [Development setup](../development.md)
 - [Project README](../../README.md)

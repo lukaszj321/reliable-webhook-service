@@ -122,6 +122,7 @@ Example response:
 ## Navigation
 
 - [API documentation index](index.md)
+- [Webhook delivery attempt API](webhook-delivery-attempts.md)
 - [Database and migrations](../database.md)
 - [Main documentation index](../index.md)
 - [Project README](../../README.md)

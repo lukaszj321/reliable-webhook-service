@@ -2,7 +2,7 @@
 
 A FastAPI service being developed toward reliable webhook ingestion and delivery.
 
-[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md)
+[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
 
 ## Table of contents
 
@@ -31,6 +31,9 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
 - ORM code can store completed attempts; the current API does not create them automatically
+- Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
+  one existing event; it returns an empty list when none exist, returns HTTP 404 for a missing
+  event, and does not create or modify attempts
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
 
@@ -41,7 +44,7 @@ The following capabilities are planned but are not currently implemented:
 - Asynchronous delivery processing
 - Retry and backoff
 - Idempotency
-- Automatic delivery attempt recording and inspection
+- Automatic delivery attempt recording
 - Manual replay
 
 ## Non-goals
@@ -67,6 +70,11 @@ flowchart LR
     EventAPI --> Session
     Session --> Event["WebhookEvent"]
     Event --> PostgreSQL
+    App --> AttemptAPI["FastAPI<br/>GET /webhook-events/{event_id}/delivery-attempts"]
+    AttemptAPI --> AttemptSession["SQLAlchemy session"]
+    AttemptSession -->|"checks existing WebhookEvent"| Event
+    AttemptSession -->|"reads stored completed attempts"| Attempt["WebhookDeliveryAttempt"]
+    Attempt --> PostgreSQL
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -113,8 +121,9 @@ See the [Development setup guide](docs/development.md) for environment configura
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
 | POST | `/webhook-events` | Store an event for an existing webhook endpoint |
+| GET | `/webhook-events/{event_id}/delivery-attempts` | List stored completed delivery attempts for one event |
 
-[API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md)
+[API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md) | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md)
 
 ## Quality checks
 
@@ -140,3 +149,4 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
+| [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md) | Listing stored attempts, ordering, empty results, HTTP 404, and read-only behavior |
