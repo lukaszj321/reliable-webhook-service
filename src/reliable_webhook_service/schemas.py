@@ -1,8 +1,15 @@
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, HttpUrl, StringConstraints, UrlConstraints
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    HttpUrl,
+    StringConstraints,
+    UrlConstraints,
+)
 
 from reliable_webhook_service.models import JsonValue
 
@@ -60,3 +67,17 @@ class WebhookEventResponse(BaseModel):
     event_type: str
     payload: dict[str, JsonValue]
     created_at: datetime
+
+
+class WebhookDeliveryAttemptResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    event_id: uuid.UUID
+    attempt_number: int
+    outcome: Literal["succeeded", "failed"]
+    target_url: str
+    response_status_code: int | None
+    error_message: str | None
+    duration_ms: int
+    attempted_at: AwareDatetime

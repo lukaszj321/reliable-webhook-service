@@ -1,3 +1,4 @@
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -5,8 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import get_session
-from reliable_webhook_service.models import WebhookEndpoint, WebhookEvent
+from reliable_webhook_service.models import (
+    WebhookDeliveryAttempt,
+    WebhookEndpoint,
+    WebhookEvent,
+)
 from reliable_webhook_service.schemas import (
+    WebhookDeliveryAttemptResponse,
     WebhookEndpointCreate,
     WebhookEndpointResponse,
     WebhookEventCreate,
@@ -84,3 +90,30 @@ def create_webhook_event(
     session.commit()
     session.refresh(event)
     return event
+
+
+@webhook_event_router.get(
+    "/{event_id}/delivery-attempts",
+    response_model=list[WebhookDeliveryAttemptResponse],
+)
+def list_webhook_delivery_attempts(
+    event_id: uuid.UUID,
+    session: SessionDependency,
+) -> list[WebhookDeliveryAttempt]:
+    event = session.get(WebhookEvent, event_id)
+    if event is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Webhook event not found",
+        )
+
+    statement = (
+        select(WebhookDeliveryAttempt)
+        .where(WebhookDeliveryAttempt.event_id == event_id)
+        .order_by(
+            WebhookDeliveryAttempt.attempt_number.asc(),
+            WebhookDeliveryAttempt.attempted_at.asc(),
+            WebhookDeliveryAttempt.id.asc(),
+        )
+    )
+    return list(session.scalars(statement).all())
