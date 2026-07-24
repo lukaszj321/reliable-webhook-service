@@ -71,7 +71,7 @@ Example response:
     "outcome": "failed",
     "target_url": "https://example.com/webhooks/orders",
     "response_status_code": 503,
-    "error_message": "Service unavailable",
+    "error_message": "HTTP response returned status 503",
     "duration_ms": 480,
     "attempted_at": "2026-07-24T09:01:00Z"
   },
@@ -82,7 +82,7 @@ Example response:
     "outcome": "failed",
     "target_url": "https://example.com/webhooks/orders",
     "response_status_code": null,
-    "error_message": "Connection timed out",
+    "error_message": "Webhook request timed out",
     "duration_ms": 3000,
     "attempted_at": "2026-07-24T09:02:00Z"
   }
@@ -132,10 +132,15 @@ Calling this endpoint:
 - does not commit database changes;
 - only reads existing data.
 
+The listing endpoint is read-only. Completed attempts can be created separately by the synchronous
+[webhook delivery execution](../delivery-execution.md) application service.
+
 ## Non-goals and current limitations
 
 - Delivery attempts are not created automatically.
-- HTTP delivery is not implemented.
+- Synchronous delivery execution exists only as an application service.
+- Delivery is not triggered automatically after event creation.
+- No public HTTP endpoint starts delivery.
 - Background processing is not implemented.
 - Retry and backoff are not implemented.
 - Replay is not implemented.
@@ -149,6 +154,7 @@ Calling this endpoint:
 - [API documentation index](index.md)
 - [Webhook endpoint API](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
+- [Webhook delivery execution](../delivery-execution.md)
 - [Main documentation index](../index.md)
 - [Database and migrations](../database.md)
 - [Project README](../../README.md)

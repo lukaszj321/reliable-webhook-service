@@ -2,7 +2,7 @@
 
 A FastAPI service being developed toward reliable webhook ingestion and delivery.
 
-[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
+[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [Delivery execution](docs/delivery-execution.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
 
 ## Table of contents
 
@@ -30,7 +30,15 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
-- ORM code can store completed attempts; the current API does not create them automatically
+- Synchronous application service that executes one webhook delivery
+- Injectable HTTP client abstraction with exactly one HTTP POST per execution
+- Explicit request timeout with redirects disabled
+- Delivery result classification: 2xx is `succeeded`; non-2xx and transport errors are `failed`
+- Completed `WebhookDeliveryAttempt` persistence with the next number for its event
+- Attempt records include the target URL snapshot, HTTP status, normalized error, duration, and
+  timezone-aware attempt timestamp
+- Delivery execution is currently available only from application code; the API does not create
+  attempts automatically
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
   one existing event; it returns an empty list when none exist, returns HTTP 404 for a missing
   event, and does not create or modify attempts
@@ -44,7 +52,7 @@ The following capabilities are planned but are not currently implemented:
 - Asynchronous delivery processing
 - Retry and backoff
 - Idempotency
-- Automatic delivery attempt recording
+- Automatic delivery execution after event creation
 - Manual replay
 
 ## Non-goals
@@ -75,16 +83,27 @@ flowchart LR
     AttemptSession -->|"checks existing WebhookEvent"| Event
     AttemptSession -->|"reads stored completed attempts"| Attempt["WebhookDeliveryAttempt"]
     Attempt --> PostgreSQL
+    ApplicationCode["Application code"] --> Execute["execute_webhook_delivery"]
+    Execute --> Prepare["prepare_webhook_delivery"]
+    Prepare -->|"reads WebhookEvent and WebhookEndpoint"| Session
+    Execute --> HTTPClient["WebhookHttpClient"]
+    HTTPClient -->|"exactly one HTTP POST"| Target["Endpoint target URL"]
+    Target --> Classification["Classify delivery result"]
+    Classification -->|"persists completed attempt"| Attempt
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
-Detailed database and API behavior is documented separately in [Database and migrations](docs/database.md) and [API documentation](docs/api/index.md).
+The FastAPI routes and application-level delivery execution are separate flows. Creating an event
+does not trigger delivery automatically. Detailed behavior is documented in
+[Database and migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md),
+and [API documentation](docs/api/index.md).
 
 ## Technology stack
 
 - Python 3.12
 - FastAPI
 - Pydantic v2
+- httpx2, used as the synchronous HTTP client for one webhook delivery
 - PostgreSQL
 - Psycopg
 - SQLAlchemy 2.x
@@ -123,6 +142,8 @@ See the [Development setup guide](docs/development.md) for environment configura
 | POST | `/webhook-events` | Store an event for an existing webhook endpoint |
 | GET | `/webhook-events/{event_id}/delivery-attempts` | List stored completed delivery attempts for one event |
 
+Delivery execution is currently an application service, not a public HTTP endpoint.
+
 [API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md) | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md)
 
 ## Quality checks
@@ -146,6 +167,7 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
 | [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, and ORM behavior |
+| [Webhook delivery execution](docs/delivery-execution.md) | Synchronous execution, result outcomes, timeout behavior, attempt numbering, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
