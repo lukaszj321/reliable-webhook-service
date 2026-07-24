@@ -142,8 +142,10 @@ details.
 
 - General event listing through `GET /webhook-events` is not available. The only read operation
   nested under an event is the delivery attempt listing for one existing event.
-- Event delivery is not implemented.
-- Retry, idempotency, and replay are not implemented.
+- `POST /webhook-events` stores the event but does not start delivery. One synchronous delivery can
+  be executed separately through the application service.
+- No public HTTP endpoint starts delivery.
+- Background processing, retry, idempotency, and replay are not implemented.
 - No payload size limit is configured.
 - Authentication is not implemented.
 
@@ -151,6 +153,7 @@ details.
 
 - [API documentation index](index.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
+- [Webhook delivery execution](../delivery-execution.md)
 - [Main documentation index](../index.md)
 - [Database and migrations](../database.md)
 - [Project README](../../README.md)

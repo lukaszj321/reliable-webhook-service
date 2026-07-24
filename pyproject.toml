@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1,<2",
     "fastapi",
+    "httpx2>=2,<3",
     "pydantic>=2,<3",
     "pydantic-settings>=2,<3",
     "psycopg[binary]>=3,<4",
@@ -20,7 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "httpx2",
     "mypy",
     "pytest",
     "ruff",

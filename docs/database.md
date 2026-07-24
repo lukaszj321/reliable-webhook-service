@@ -247,8 +247,12 @@ through SQLAlchemy's ORM configuration.
 - `response_status_code` and `error_message` are nullable.
 - The table stores only completed attempts.
 - The current API does not create attempt records automatically.
-- No API exists for listing attempts.
-- HTTP delivery, workers, retry, backoff, and replay are not implemented.
+- Read-only `GET /webhook-events/{event_id}/delivery-attempts` lists stored completed attempts for
+  one existing event without creating or modifying them. A top-level
+  `GET /webhook-delivery-attempts` endpoint does not exist.
+- Synchronous execution of one delivery exists as an application service. It is not triggered
+  automatically after event creation, and no public HTTP endpoint starts delivery. Workers,
+  background processing, retry, backoff, and replay are not implemented.
 
 **Shared persistence configuration**
 
@@ -277,4 +281,5 @@ endpoint currently accepts delivery attempt data. See
 
 - [Documentation index](index.md)
 - [Development setup](development.md)
+- [Webhook delivery execution](delivery-execution.md)
 - [Project README](../README.md)
