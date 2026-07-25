@@ -287,3 +287,148 @@ def test_webhook_delivery_attempt_migration() -> None:
     assert final_inspector.has_table("webhook_delivery_attempts") is True
     assert final_inspector.has_table("webhook_events") is True
     assert final_inspector.has_table("webhook_endpoints") is True
+
+
+def test_webhook_delivery_job_migration() -> None:
+    alembic_config = Config("alembic.ini")
+    alembic_config.set_main_option("path_separator", "os")
+
+    try:
+        command.upgrade(alembic_config, "head")
+
+        inspector = inspect(engine)
+        assert inspector.has_table("webhook_endpoints") is True
+        assert inspector.has_table("webhook_events") is True
+        assert inspector.has_table("webhook_delivery_attempts") is True
+        assert inspector.has_table("webhook_delivery_jobs") is True
+
+        columns = inspector.get_columns("webhook_delivery_jobs")
+        assert [column["name"] for column in columns] == [
+            "id",
+            "event_id",
+            "status",
+            "next_attempt_at",
+            "created_at",
+            "updated_at",
+        ]
+        columns_by_name = {column["name"]: column for column in columns}
+
+        id_column = columns_by_name["id"]
+        assert isinstance(id_column["type"], UUID)
+        assert id_column["nullable"] is False
+        assert id_column["default"] is None
+
+        event_id_column = columns_by_name["event_id"]
+        assert isinstance(event_id_column["type"], UUID)
+        assert event_id_column["nullable"] is False
+        assert event_id_column["default"] is None
+
+        status_column = columns_by_name["status"]
+        assert isinstance(status_column["type"], String)
+        assert status_column["type"].length == 32
+        assert status_column["nullable"] is False
+        assert status_column["default"] is None
+
+        next_attempt_at_column = columns_by_name["next_attempt_at"]
+        assert isinstance(next_attempt_at_column["type"], DateTime)
+        assert next_attempt_at_column["type"].timezone is True
+        assert next_attempt_at_column["nullable"] is True
+        assert next_attempt_at_column["default"] is None
+
+        created_at_column = columns_by_name["created_at"]
+        assert isinstance(created_at_column["type"], DateTime)
+        assert created_at_column["type"].timezone is True
+        assert created_at_column["nullable"] is False
+        assert created_at_column["default"] is not None
+        assert "now()" in str(created_at_column["default"]).lower()
+
+        updated_at_column = columns_by_name["updated_at"]
+        assert isinstance(updated_at_column["type"], DateTime)
+        assert updated_at_column["type"].timezone is True
+        assert updated_at_column["nullable"] is False
+        assert updated_at_column["default"] is not None
+        assert "now()" in str(updated_at_column["default"]).lower()
+
+        primary_key = inspector.get_pk_constraint("webhook_delivery_jobs")
+        assert primary_key["constrained_columns"] == ["id"]
+
+        foreign_keys = inspector.get_foreign_keys("webhook_delivery_jobs")
+        assert len(foreign_keys) == 1
+        foreign_key = foreign_keys[0]
+        assert foreign_key["constrained_columns"] == ["event_id"]
+        assert foreign_key["referred_table"] == "webhook_events"
+        assert foreign_key["referred_columns"] == ["id"]
+        assert foreign_key["options"].get("ondelete") == "CASCADE"
+
+        unique_constraints = inspector.get_unique_constraints("webhook_delivery_jobs")
+        event_id_unique_constraints = [
+            constraint
+            for constraint in unique_constraints
+            if constraint["name"] == "uq_webhook_delivery_jobs_event_id"
+        ]
+        assert len(event_id_unique_constraints) == 1
+        event_id_unique_constraint = event_id_unique_constraints[0]
+        assert event_id_unique_constraint["column_names"] == ["event_id"]
+
+        check_constraints = inspector.get_check_constraints("webhook_delivery_jobs")
+        normalized_checks = {
+            constraint["name"]: " ".join(str(constraint["sqltext"]).lower().split())
+            for constraint in check_constraints
+        }
+        assert set(normalized_checks) == {
+            "ck_webhook_delivery_jobs_status",
+            "ck_webhook_delivery_jobs_status_next_attempt_at",
+        }
+
+        status_check = normalized_checks["ck_webhook_delivery_jobs_status"]
+        assert "status" in status_check
+        assert "pending" in status_check
+        assert "processing" in status_check
+        assert "succeeded" in status_check
+        assert "dead_letter" in status_check
+
+        status_next_attempt_at_check = normalized_checks[
+            "ck_webhook_delivery_jobs_status_next_attempt_at"
+        ]
+        assert "status" in status_next_attempt_at_check
+        assert "next_attempt_at" in status_next_attempt_at_check
+        assert "pending" in status_next_attempt_at_check
+        assert "processing" in status_next_attempt_at_check
+        assert "succeeded" in status_next_attempt_at_check
+        assert "dead_letter" in status_next_attempt_at_check
+        assert "is not null" in status_next_attempt_at_check
+        assert "is null" in status_next_attempt_at_check
+        assert " or " in status_next_attempt_at_check
+
+        indexes = inspector.get_indexes("webhook_delivery_jobs")
+        assert all(index["name"] != "ix_webhook_delivery_jobs_event_id" for index in indexes)
+        unexpected_indexes = [
+            index
+            for index in indexes
+            if index.get("duplicates_constraint") != "uq_webhook_delivery_jobs_event_id"
+        ]
+        assert unexpected_indexes == []
+
+        command.downgrade(alembic_config, "10f4dd620e97")
+
+        downgraded_inspector = inspect(engine)
+        assert downgraded_inspector.has_table("webhook_delivery_jobs") is False
+        assert downgraded_inspector.has_table("webhook_delivery_attempts") is True
+        assert downgraded_inspector.has_table("webhook_events") is True
+        assert downgraded_inspector.has_table("webhook_endpoints") is True
+
+        command.upgrade(alembic_config, "head")
+
+        upgraded_inspector = inspect(engine)
+        assert upgraded_inspector.has_table("webhook_delivery_jobs") is True
+        assert upgraded_inspector.has_table("webhook_delivery_attempts") is True
+        assert upgraded_inspector.has_table("webhook_events") is True
+        assert upgraded_inspector.has_table("webhook_endpoints") is True
+    finally:
+        command.upgrade(alembic_config, "head")
+
+    final_inspector = inspect(engine)
+    assert final_inspector.has_table("webhook_delivery_jobs") is True
+    assert final_inspector.has_table("webhook_delivery_attempts") is True
+    assert final_inspector.has_table("webhook_events") is True
+    assert final_inspector.has_table("webhook_endpoints") is True
