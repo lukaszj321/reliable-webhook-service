@@ -1,3 +1,7 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+import httpx2
 from fastapi import FastAPI
 
 from reliable_webhook_service.api import (
@@ -6,12 +10,32 @@ from reliable_webhook_service.api import (
 from reliable_webhook_service.api import (
     webhook_event_router,
 )
-
-app = FastAPI(title="Reliable Webhook Delivery Service")
-app.include_router(webhook_endpoint_router)
-app.include_router(webhook_event_router)
+from reliable_webhook_service.delivery_http import Httpx2WebhookHttpClient
 
 
-@app.get("/health")
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    with httpx2.Client() as raw_http_client:
+        application.state.webhook_http_client = Httpx2WebhookHttpClient(raw_http_client)
+        try:
+            yield
+        finally:
+            del application.state.webhook_http_client
+
+
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def create_app() -> FastAPI:
+    application = FastAPI(
+        title="Reliable Webhook Delivery Service",
+        lifespan=lifespan,
+    )
+    application.include_router(webhook_endpoint_router)
+    application.include_router(webhook_event_router)
+    application.add_api_route("/health", health, methods=["GET"])
+    return application
+
+
+app = create_app()
