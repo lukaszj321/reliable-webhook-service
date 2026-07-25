@@ -17,16 +17,16 @@ Read the documentation in this order:
 - [Development setup](development.md) — install, configure, run, and validate the project locally.
 - [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
   migrations, and the current database schema.
-- [Webhook delivery execution](delivery-execution.md) — synchronous request execution, result
-  classification, attempt persistence, and current limitations.
+- [Webhook delivery execution](delivery-execution.md) — application service and public manual
+  execution, result classification, attempt persistence, and current limitations.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
   listing behavior.
 - [Webhook event API](api/webhook-events.md) — event creation, validation, persistence, and error
   responses.
-- [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — read-only listing of stored
-  attempts, ordering, and error responses.
+- [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`
+  and read-only listing with `GET`, including outcomes, ordering, and error responses.
 
 ## Common tasks
 
@@ -49,7 +49,8 @@ Read the documentation in this order:
 - [List webhook endpoints](api/webhook-endpoints.md#list-webhook-endpoints)
 - [Review request validation](api/webhook-endpoints.md#request-validation)
 - [Create a webhook event](api/webhook-events.md#endpoint)
-- [List delivery attempts](api/webhook-delivery-attempts.md#endpoint)
+- [Manually execute one webhook delivery](api/webhook-delivery-attempts.md#manual-delivery-endpoint)
+- [List delivery attempts](api/webhook-delivery-attempts.md#listing-endpoint)
 
 ## Navigation
 

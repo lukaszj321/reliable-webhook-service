@@ -51,9 +51,16 @@ Create the local environment file from the public development example:
 Copy-Item .env.example .env
 ```
 
-The application, Alembic, and tests load the database connection from `DATABASE_URL`. Docker
-Compose uses the PostgreSQL values and `POSTGRES_PORT` from the same local `.env` file. The file is
-ignored by Git and should contain only local settings, not committed secrets.
+The application, Alembic, and tests use `DATABASE_URL` to connect to PostgreSQL. Docker Compose
+uses the PostgreSQL values and `POSTGRES_PORT` from the same local `.env` file.
+
+`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` controls the timeout for the single outgoing request made by
+the manual delivery POST endpoint. Its default is `10.0` seconds, and its value must be a positive,
+finite number. This is application configuration: a request cannot override it through a body or
+query parameter.
+
+The local `.env` file is ignored by Git and should contain only local settings, not committed
+secrets.
 
 ## Start PostgreSQL
 

@@ -44,12 +44,19 @@ details.
 
 ## Webhook delivery attempt API
 
-`GET /webhook-events/{event_id}/delivery-attempts` reads stored completed delivery attempts for one
-existing event. It returns an empty list when the event has no attempts and HTTP 404 when the event
-does not exist. The endpoint does not create attempts automatically.
+Available routes:
+
+- `POST /webhook-events/{event_id}/delivery-attempts` manually executes and persists one
+  synchronous delivery attempt. It returns HTTP 201 for both `succeeded` and expected `failed`
+  outcomes.
+- `GET /webhook-events/{event_id}/delivery-attempts` reads stored completed delivery attempts for
+  one existing event. It returns an empty list when the event has no attempts and HTTP 404 when the
+  event does not exist.
+
+Creating an event through `POST /webhook-events` does not invoke manual delivery automatically.
 
 See [Webhook delivery attempt API](webhook-delivery-attempts.md) for response fields, ordering,
-empty results, errors, and read-only behavior.
+manual execution behavior, outcomes, empty results, and errors.
 
 ## Interactive documentation
 
