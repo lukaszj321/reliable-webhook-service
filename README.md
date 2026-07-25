@@ -27,6 +27,15 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Pydantic request validation for webhook events
 - PostgreSQL JSONB persistence linked to an existing `WebhookEndpoint`
 - HTTP 404 response when the referenced webhook endpoint does not exist
+- `WebhookDeliveryJob` ORM model and `webhook_delivery_jobs` PostgreSQL table for durable processing
+  state linked to `WebhookEvent`, with at most one job per event
+- Delivery job statuses: `pending`, `processing`, `succeeded`, and `dead_letter`
+- Delivery job scheduling constraints require `next_attempt_at` for `pending` and `processing`, and
+  require `next_attempt_at=NULL` for `succeeded` and `dead_letter`
+- Database `ON DELETE CASCADE` removes a delivery job when its event is deleted
+- Delivery jobs are a persistence foundation only: event creation does not create them
+  automatically, and no worker, polling loop, job-based retry/backoff execution, or public job API
+  exists
 - `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
@@ -102,9 +111,11 @@ flowchart LR
 The manual POST route supplies the database session, HTTP client, and configured timeout to
 `execute_webhook_delivery`. The service performs one outgoing HTTP POST and persists the completed
 attempt in PostgreSQL. The GET route reads those stored attempts. `POST /webhook-events` only
-stores an event and does not trigger delivery automatically. Detailed behavior is documented in
-[Database and migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md),
-and [API documentation](docs/api/index.md).
+stores an event and does not trigger delivery automatically. The durable delivery job schema exists
+as a persistence foundation, but it is not shown as a runtime flow because jobs are not created
+automatically and no worker exists. Detailed behavior is documented in [Database and
+migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and
+[API documentation](docs/api/index.md).
 
 ## Technology stack
 
