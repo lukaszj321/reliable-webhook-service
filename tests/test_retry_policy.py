@@ -105,7 +105,8 @@ def test_calculate_retry_delay_rejects_invalid_attempt_number(
 
 
 @pytest.mark.parametrize(
-    "base_delay_seconds", [0.0, -1.0, float("nan"), float("inf"), -float("inf")]
+    "base_delay_seconds",
+    [0.0, -1.0, float("nan"), float("inf"), -float("inf"), True, False],
 )
 def test_calculate_retry_delay_rejects_invalid_base_delay(
     base_delay_seconds: float,
@@ -119,7 +120,8 @@ def test_calculate_retry_delay_rejects_invalid_base_delay(
 
 
 @pytest.mark.parametrize(
-    "max_delay_seconds", [0.0, -1.0, float("nan"), float("inf"), -float("inf")]
+    "max_delay_seconds",
+    [0.0, -1.0, float("nan"), float("inf"), -float("inf"), True, False],
 )
 def test_calculate_retry_delay_rejects_invalid_max_delay(
     max_delay_seconds: float,
