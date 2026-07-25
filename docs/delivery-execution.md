@@ -12,6 +12,7 @@ service and returns one persisted `WebhookDeliveryAttempt`.
 - [Result classification](#result-classification)
 - [Attempt persistence](#attempt-persistence)
 - [Attempt numbering](#attempt-numbering)
+- [Retry decision policy](#retry-decision-policy)
 - [Error handling](#error-handling)
 - [Invocation](#invocation)
 - [Current limitations](#current-limitations)
@@ -91,6 +92,40 @@ protects the pair of `event_id` and `attempt_number`.
 
 Concurrent attempt-number allocation remains outside the current scope.
 
+## Retry decision policy
+
+The retry decision policy is separate from `execute_webhook_delivery`, which continues to execute
+exactly one HTTP request. After an attempt is complete, the pure policy accepts its `outcome`,
+`attempt_number`, an explicit timezone-aware `decision_at`, and the retry settings. It does not
+perform HTTP, read the system time, write to PostgreSQL, or update `WebhookDeliveryJob`.
+
+The policy returns an immutable `RetryDecision` containing `status` and `next_attempt_at`:
+
+| Outcome / attempt state | Decision status | `next_attempt_at` |
+|---|---|---|
+| `succeeded` | `succeeded` | `null` |
+| `failed` and `attempt_number < max_attempts` | `pending` | `decision_at` normalized to UTC plus the retry delay |
+| `failed` and `attempt_number >= max_attempts` | `dead_letter` | `null` |
+
+`max_attempts` is the total allowed number of attempts, including the first. Treating attempt
+numbers above the limit as `dead_letter` also handles configurations lowered after earlier attempts
+were recorded. `processing` remains a possible `WebhookDeliveryJob` state, but it is not a retry
+decision status.
+
+The exponential-backoff delay is:
+
+```text
+delay = min(
+    base_delay_seconds * 2 ** (attempt_number - 1),
+    max_delay_seconds
+)
+```
+
+With the defaults, attempts 1 through 4 produce delays of 5, 10, 20, and 40 seconds. Later values
+grow up to the 300-second cap, and very large attempt numbers are safely capped. There is no jitter,
+randomness, sleep, or implicit current-time lookup. Passing `decision_at` explicitly makes the
+result deterministic, and a pending `next_attempt_at` is normalized to UTC.
+
 ## Error handling
 
 - Preparation errors occur before the request and do not create an attempt.
@@ -130,7 +165,8 @@ manual delivery endpoint automatically.
 
 - No automatic delivery trigger
 - No background processing
-- No retry or backoff
+- Retry policy and backoff calculation exist, but no worker or automatic retry execution invokes
+  them
 - No replay
 - No idempotency
 - No concurrent attempt-number allocation
