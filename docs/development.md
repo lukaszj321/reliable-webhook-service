@@ -54,10 +54,17 @@ Copy-Item .env.example .env
 The application, Alembic, and tests use `DATABASE_URL` to connect to PostgreSQL. Docker Compose
 uses the PostgreSQL values and `POSTGRES_PORT` from the same local `.env` file.
 
-`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` controls the timeout for the single outgoing request made by
-the manual delivery POST endpoint. Its default is `10.0` seconds, and its value must be a positive,
-finite number. This is application configuration: a request cannot override it through a body or
-query parameter.
+| Setting | Default | Validation | Meaning |
+|---|---:|---|---|
+| `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` | `10.0` | Positive, finite number | Timeout in seconds for the single outgoing HTTP request made by the manual delivery POST endpoint |
+| `WEBHOOK_DELIVERY_MAX_ATTEMPTS` | `5` | Integer greater than or equal to 1 | Total number of allowed attempts, including the first attempt |
+| `WEBHOOK_DELIVERY_RETRY_BASE_SECONDS` | `5.0` | Positive, finite number | Delay after the first failed attempt and base for exponential backoff |
+| `WEBHOOK_DELIVERY_RETRY_MAX_SECONDS` | `300.0` | Positive, finite number | Maximum retry delay in seconds |
+
+`WEBHOOK_DELIVERY_RETRY_BASE_SECONDS` must be less than or equal to
+`WEBHOOK_DELIVERY_RETRY_MAX_SECONDS`. The retry settings configure the existing pure retry policy;
+they do not start a worker or execute, schedule, or persist retries automatically. The timeout is
+application configuration and cannot be overridden through a request body or query parameter.
 
 The local `.env` file is ignored by Git and should contain only local settings, not committed
 secrets.

@@ -51,6 +51,10 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - HTTP 201 for both persisted `succeeded` and `failed` delivery attempts
 - Configurable positive, finite `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` application setting, with a
   default of 10.0 seconds
+- Configurable total attempt limit and exponential-backoff base and maximum delay settings
+- Pure, deterministic retry policy with no jitter that returns `pending`, `succeeded`, or
+  `dead_letter` decisions and normalizes timezone-aware `next_attempt_at` values to UTC
+- Retry policy is not connected to a worker or automatic delivery-job handling
 - HTTP 404 for a missing event and HTTP 409 for a missing or inactive endpoint before execution
 - Manual-only execution: creating a webhook event does not trigger delivery automatically
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
@@ -64,7 +68,7 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 The following capabilities are planned but are not currently implemented:
 
 - Asynchronous delivery processing
-- Retry and backoff
+- Automatic retry execution and delivery-job scheduling
 - Idempotency
 - Automatic delivery execution after event creation
 - Manual replay
@@ -113,9 +117,10 @@ The manual POST route supplies the database session, HTTP client, and configured
 attempt in PostgreSQL. The GET route reads those stored attempts. `POST /webhook-events` only
 stores an event and does not trigger delivery automatically. The durable delivery job schema exists
 as a persistence foundation, but it is not shown as a runtime flow because jobs are not created
-automatically and no worker exists. Detailed behavior is documented in [Database and
-migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and
-[API documentation](docs/api/index.md).
+automatically and no worker exists. The pure retry policy also exists outside the shown runtime flow
+and awaits integration with a future worker. Detailed behavior is documented in [Database and
+migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
+documentation](docs/api/index.md).
 
 ## Technology stack
 
@@ -188,7 +193,7 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
 | [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, and ORM behavior |
-| [Webhook delivery execution](docs/delivery-execution.md) | Application service and public manual execution flow, result outcomes, timeout behavior, attempt numbering, and limitations |
+| [Webhook delivery execution](docs/delivery-execution.md) | Application service, public manual execution flow, result outcomes, retry decision policy, exponential backoff, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
