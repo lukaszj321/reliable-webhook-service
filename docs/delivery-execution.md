@@ -1,7 +1,8 @@
 # Webhook Delivery Execution
 
-The application provides a synchronous service that executes one webhook delivery and persists one
-completed `WebhookDeliveryAttempt`.
+The application provides two connected execution levels: the synchronous
+`execute_webhook_delivery` application service and a public manual HTTP endpoint that invokes the
+service and returns one persisted `WebhookDeliveryAttempt`.
 
 ## Contents
 
@@ -18,9 +19,10 @@ completed `WebhookDeliveryAttempt`.
 
 ## Current execution model
 
-Delivery execution is synchronous. One call performs at most one HTTP request, and every request
-that is actually executed ends with an attempt to persist one completed delivery attempt. The
-service does not retry requests, and creating a webhook event does not trigger delivery
+Delivery execution is synchronous. One service call performs at most one HTTP request, and every
+request that is actually executed ends with an attempt to persist one completed delivery attempt.
+The public manual POST route calls that service with a database session, HTTP client, and configured
+timeout. The service does not retry requests, and creating a webhook event does not trigger delivery
 automatically.
 
 ## Preparation and validation
@@ -100,9 +102,29 @@ Concurrent attempt-number allocation remains outside the current scope.
 
 ## Invocation
 
-`execute_webhook_delivery` is currently called directly from application code. No public HTTP
-endpoint starts a delivery. `POST /webhook-events` only stores an event and does not call the
-delivery service. The delivery-attempt listing API only reads previously stored attempts.
+Application code can call `execute_webhook_delivery` directly. The public manual API invokes the
+same service through:
+
+```text
+POST /webhook-events/{event_id}/delivery-attempts
+```
+
+The route accepts a UUID path parameter and no request body. It synchronously performs exactly one
+outgoing request, using the timeout from `Settings`, and returns HTTP 201 with the persisted attempt.
+Both `succeeded` and expected `failed` delivery outcomes return HTTP 201 because the attempt was
+successfully completed and stored. Non-2xx responses, timeouts, and other transport errors are
+delivery results rather than API errors.
+
+Preparation errors occur before an outgoing request and do not create an attempt:
+
+| Application error | HTTP status | API detail |
+|---|---|---|
+| `WebhookEventNotFoundError` | 404 | `Webhook event not found` |
+| `WebhookEndpointNotFoundError` | 409 | `Webhook endpoint not found` |
+| `InactiveWebhookEndpointError` | 409 | `Webhook endpoint is inactive` |
+
+`POST /webhook-events` only stores an event. It does not call the delivery service or invoke the
+manual delivery endpoint automatically.
 
 ## Current limitations
 
@@ -114,7 +136,6 @@ delivery service. The delivery-attempt listing API only reads previously stored 
 - No concurrent attempt-number allocation
 - No request signing
 - No custom headers
-- No public execution API
 - No response body persistence
 
 ## Navigation

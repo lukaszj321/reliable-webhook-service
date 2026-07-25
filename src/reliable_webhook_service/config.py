@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,3 +12,4 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+psycopg://reliable_webhook:reliable_webhook@127.0.0.1:5432/reliable_webhook"
     )
+    webhook_delivery_timeout_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)

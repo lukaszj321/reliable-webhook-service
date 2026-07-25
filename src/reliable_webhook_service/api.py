@@ -6,6 +6,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import get_session
+from reliable_webhook_service.delivery_service import (
+    InactiveWebhookEndpointError,
+    WebhookEndpointNotFoundError,
+    WebhookEventNotFoundError,
+    execute_webhook_delivery,
+)
+from reliable_webhook_service.dependencies import (
+    SettingsDependency,
+    WebhookHttpClientDependency,
+)
 from reliable_webhook_service.models import (
     WebhookDeliveryAttempt,
     WebhookEndpoint,
@@ -117,3 +127,33 @@ def list_webhook_delivery_attempts(
         )
     )
     return list(session.scalars(statement).all())
+
+
+@webhook_event_router.post(
+    "/{event_id}/delivery-attempts",
+    response_model=WebhookDeliveryAttemptResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_webhook_delivery_attempt(
+    event_id: uuid.UUID,
+    session: SessionDependency,
+    http_client: WebhookHttpClientDependency,
+    settings: SettingsDependency,
+) -> WebhookDeliveryAttempt:
+    try:
+        return execute_webhook_delivery(
+            session,
+            event_id=event_id,
+            http_client=http_client,
+            timeout_seconds=settings.webhook_delivery_timeout_seconds,
+        )
+    except WebhookEventNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except (WebhookEndpointNotFoundError, InactiveWebhookEndpointError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
