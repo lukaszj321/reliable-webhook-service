@@ -114,7 +114,7 @@ def test_dependency_requires_active_lifespan() -> None:
         get_webhook_http_client(_request_for(application))
 
 
-def test_health_and_business_routes_remain_unchanged(
+def test_health_and_business_routes_match_current_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_client(monkeypatch)
@@ -127,16 +127,21 @@ def test_health_and_business_routes_remain_unchanged(
     assert response.json() == {"status": "ok"}
 
     schema = application.openapi()
-    business_routes = {
+    business_routes = sorted(
         (method.upper(), path)
         for path, operations in schema["paths"].items()
         for method in operations
-    }
-    assert business_routes == {
-        ("GET", "/health"),
-        ("GET", "/webhook-endpoints"),
-        ("POST", "/webhook-endpoints"),
-        ("POST", "/webhook-events"),
-        ("GET", "/webhook-events/{event_id}/delivery-attempts"),
-    }
-    assert ("POST", "/webhook-events/{event_id}/delivery-attempts") not in business_routes
+    )
+    assert business_routes == sorted(
+        [
+            ("GET", "/health"),
+            ("GET", "/webhook-endpoints"),
+            ("POST", "/webhook-endpoints"),
+            ("POST", "/webhook-events"),
+            ("GET", "/webhook-events/{event_id}/delivery-attempts"),
+            ("POST", "/webhook-events/{event_id}/delivery-attempts"),
+        ]
+    )
+    assert business_routes.count(("GET", "/webhook-events/{event_id}/delivery-attempts")) == 1
+    assert business_routes.count(("POST", "/webhook-events/{event_id}/delivery-attempts")) == 1
+    assert business_routes.count(("POST", "/webhook-delivery-attempts")) == 0
