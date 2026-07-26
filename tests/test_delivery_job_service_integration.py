@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import SessionFactory
@@ -514,3 +514,86 @@ def test_caller_commit_persists_claim(
         assert stored_job.next_attempt_at is not None
         assert _as_utc(stored_job.next_attempt_at) == next_attempt_at
         assert _as_utc(stored_job.updated_at) == claimed_at.astimezone(UTC)
+
+
+def test_concurrent_claimers_skip_locked_jobs(
+    created_records: _CreatedRecords,
+) -> None:
+    base_time = datetime(1900, 8, 1, tzinfo=UTC)
+    claimed_at = base_time + timedelta(days=1)
+    expected_next_attempts = [base_time + timedelta(seconds=index) for index in range(3)]
+
+    with SessionFactory() as setup_session:
+        jobs = [
+            _add_job(
+                setup_session,
+                created_records,
+                label=f"concurrent-{label}",
+                status="pending",
+                next_attempt_at=next_attempt_at,
+                created_at=base_time,
+            )
+            for label, next_attempt_at in zip(
+                ("a", "b", "c"),
+                expected_next_attempts,
+                strict=True,
+            )
+        ]
+        setup_session.commit()
+        expected_job_ids = [job.id for job in jobs]
+
+    assert all(next_attempt_at <= claimed_at for next_attempt_at in expected_next_attempts)
+
+    session_a = SessionFactory()
+    session_b = SessionFactory()
+    try:
+        claimed_by_a = claim_due_webhook_delivery_jobs(
+            session_a,
+            claimed_at=claimed_at,
+            limit=1,
+        )
+        claimed_by_a_ids = [job.id for job in claimed_by_a]
+
+        assert len(claimed_by_a) == 1
+        assert claimed_by_a_ids == [expected_job_ids[0]]
+        assert _get_job(session_a, expected_job_ids[0]).status == "processing"
+        assert session_a.in_transaction()
+
+        session_b.execute(text("SET LOCAL lock_timeout = '1s'"))
+        claimed_by_b = claim_due_webhook_delivery_jobs(
+            session_b,
+            claimed_at=claimed_at,
+            limit=2,
+        )
+        claimed_by_b_ids = [job.id for job in claimed_by_b]
+
+        assert len(claimed_by_b) == 2
+        assert claimed_by_b_ids == expected_job_ids[1:]
+        assert expected_job_ids[0] not in claimed_by_b_ids
+        assert set(claimed_by_a_ids).isdisjoint(claimed_by_b_ids)
+        assert set(claimed_by_a_ids + claimed_by_b_ids) == set(expected_job_ids)
+        assert [_get_job(session_b, job_id).status for job_id in claimed_by_b_ids] == [
+            "processing",
+            "processing",
+        ]
+
+        visible_status = session_b.scalar(
+            select(WebhookDeliveryJob.status).where(WebhookDeliveryJob.id == expected_job_ids[0])
+        )
+        assert visible_status == "pending"
+    finally:
+        session_b.rollback()
+        session_a.rollback()
+        session_b.close()
+        session_a.close()
+
+    with SessionFactory() as verification_session:
+        for job_id, expected_next_attempt_at in zip(
+            expected_job_ids,
+            expected_next_attempts,
+            strict=True,
+        ):
+            stored_job = _get_job(verification_session, job_id)
+            assert stored_job.status == "pending"
+            assert stored_job.next_attempt_at is not None
+            assert _as_utc(stored_job.next_attempt_at) == expected_next_attempt_at
