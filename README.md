@@ -33,9 +33,16 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Delivery job scheduling constraints require `next_attempt_at` for `pending` and `processing`, and
   require `next_attempt_at=NULL` for `succeeded` and `dead_letter`
 - Database `ON DELETE CASCADE` removes a delivery job when its event is deleted
-- Delivery jobs are a persistence foundation only: event creation does not create them
-  automatically, and no worker, polling loop, job-based retry/backoff execution, or public job API
-  exists
+- Synchronous application service for claiming batches of due `pending` delivery jobs
+- PostgreSQL `SELECT FOR UPDATE SKIP LOCKED` row-level locking with deterministic ordering by
+  `next_attempt_at`, `created_at`, and `id`
+- Caller-selected claim batch limit and the `pending` to `processing` state transition
+- Caller-owned claim transaction: the service flushes changes but does not commit or roll back
+- Real PostgreSQL tests with two independent sessions confirm locked jobs are skipped and claims do
+  not overlap
+- Event creation does not create jobs automatically. No worker, polling loop, automatic claim
+  invocation, automatic HTTP execution, completion handling, automatic retry scheduling, stale
+  `processing` recovery, or public job API exists
 - `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
@@ -116,9 +123,10 @@ The manual POST route supplies the database session, HTTP client, and configured
 `execute_webhook_delivery`. The service performs one outgoing HTTP POST and persists the completed
 attempt in PostgreSQL. The GET route reads those stored attempts. `POST /webhook-events` only
 stores an event and does not trigger delivery automatically. The durable delivery job schema exists
-as a persistence foundation, but it is not shown as a runtime flow because jobs are not created
-automatically and no worker exists. The pure retry policy also exists outside the shown runtime flow
-and awaits integration with a future worker. Detailed behavior is documented in [Database and
+with a synchronous delivery job claiming application service. The claim service is not invoked by
+the API or a worker, so it is not shown as an active runtime flow. Jobs are not created
+automatically, and no worker exists. The pure retry policy and claim service both await integration
+with a future worker. Detailed behavior is documented in [Database and
 migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
 documentation](docs/api/index.md).
 
@@ -192,8 +200,8 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 |---|---|
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
-| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, and ORM behavior |
-| [Webhook delivery execution](docs/delivery-execution.md) | Application service, public manual execution flow, result outcomes, retry decision policy, exponential backoff, and limitations |
+| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, ORM behavior, delivery job claiming, and `SKIP LOCKED` transaction semantics |
+| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution flow, result outcomes, retry decisions, delivery job claiming infrastructure, transaction ownership, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
