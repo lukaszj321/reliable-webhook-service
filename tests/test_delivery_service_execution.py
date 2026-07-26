@@ -165,6 +165,13 @@ def test_execute_delivery_persists_successful_attempt() -> None:
             assert attempt.error_message is None
             assert attempt.duration_ms == 125
             assert attempt.attempted_at == attempted_at
+            assert session.in_transaction() is True
+
+            with SessionFactory() as observer_session:
+                assert observer_session.get(WebhookDeliveryAttempt, attempt.id) is None
+                observer_session.rollback()
+
+            session.commit()
 
         assert len(requests) == 1
         assert _attempt_ids_for_event(event_id) == attempt_ids
@@ -239,6 +246,7 @@ def test_execute_delivery_persists_failed_http_response() -> None:
             assert attempt.response_status_code == 503
             assert attempt.error_message == "HTTP response returned status 503"
             assert "private upstream response body" not in attempt.error_message
+            session.commit()
 
         assert len(requests) == 1
         assert _attempt_ids_for_event(event_id) == attempt_ids
@@ -286,6 +294,7 @@ def test_execute_delivery_persists_timeout() -> None:
             assert attempt.response_status_code is None
             assert attempt.error_message == "Webhook request timed out"
             assert session.scalar(select(1)) == 1
+            session.commit()
 
         assert len(requests) == 1
         assert _attempt_ids_for_event(event_id) == attempt_ids
@@ -334,6 +343,7 @@ def test_execute_delivery_persists_connection_failure() -> None:
             assert attempt.response_status_code is None
             assert attempt.error_message == "Webhook request failed: ConnectError"
             assert private_error not in attempt.error_message
+            session.commit()
 
         assert len(requests) == 1
         assert _attempt_ids_for_event(event_id) == attempt_ids
@@ -402,6 +412,7 @@ def test_execute_delivery_increments_attempt_numbers() -> None:
             attempt_ids.extend([first_attempt.id, second_attempt.id])
             assert first_attempt.attempt_number == 1
             assert second_attempt.attempt_number == 2
+            session.commit()
 
         assert len(requests) == 2
         with SessionFactory() as session:
@@ -545,6 +556,7 @@ def test_execute_delivery_uses_non_negative_duration() -> None:
             assert isinstance(attempt.id, uuid.UUID)
             attempt_ids.append(attempt.id)
             assert attempt.duration_ms == 0
+            session.commit()
 
         assert len(requests) == 1
         assert _attempt_ids_for_event(event_id) == attempt_ids

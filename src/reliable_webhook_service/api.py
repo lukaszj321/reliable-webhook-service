@@ -145,7 +145,7 @@ def create_webhook_delivery_attempt(
     settings: SettingsDependency,
 ) -> WebhookDeliveryAttempt:
     try:
-        return execute_webhook_delivery(
+        attempt = execute_webhook_delivery(
             session,
             event_id=event_id,
             http_client=http_client,
@@ -161,3 +161,7 @@ def create_webhook_delivery_attempt(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(error),
         ) from error
+
+    session.commit()
+    session.refresh(attempt)
+    return attempt

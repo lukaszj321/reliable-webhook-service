@@ -2,7 +2,7 @@ import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Self
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from fastapi import FastAPI
@@ -116,13 +116,12 @@ def test_successful_attempt_returns_201_and_calls_service_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, http_client = _configure_dependencies(application)
-    service = Mock(
-        return_value=_attempt(
-            outcome="succeeded",
-            response_status_code=204,
-            error_message=None,
-        )
+    attempt = _attempt(
+        outcome="succeeded",
+        response_status_code=204,
+        error_message=None,
     )
+    service = Mock(return_value=attempt)
     monkeypatch.setattr(api, "execute_webhook_delivery", service)
 
     with TestClient(application) as client:
@@ -139,7 +138,14 @@ def test_successful_attempt_returns_201_and_calls_service_once(
         http_client=http_client,
         timeout_seconds=2.5,
     )
-    assert session.mock_calls == []
+    assert session.mock_calls == [
+        call.commit(),
+        call.refresh(attempt),
+    ]
+    session.commit.assert_called_once_with()
+    session.refresh.assert_called_once_with(attempt)
+    session.rollback.assert_not_called()
+    session.close.assert_not_called()
     assert http_client.mock_calls == []
 
 
@@ -147,14 +153,13 @@ def test_failed_attempt_returns_201(
     application: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_dependencies(application)
-    service = Mock(
-        return_value=_attempt(
-            outcome="failed",
-            response_status_code=503,
-            error_message="HTTP response returned status 503",
-        )
+    session, _ = _configure_dependencies(application)
+    attempt = _attempt(
+        outcome="failed",
+        response_status_code=503,
+        error_message="HTTP response returned status 503",
     )
+    service = Mock(return_value=attempt)
     monkeypatch.setattr(api, "execute_webhook_delivery", service)
 
     with TestClient(application) as client:
@@ -165,6 +170,12 @@ def test_failed_attempt_returns_201(
     assert response.json()["response_status_code"] == 503
     assert response.json()["error_message"] == "HTTP response returned status 503"
     service.assert_called_once()
+    session.commit.assert_called_once_with()
+    session.refresh.assert_called_once_with(attempt)
+    assert session.mock_calls == [
+        call.commit(),
+        call.refresh(attempt),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -194,7 +205,7 @@ def test_preparation_error_mapping(
     expected_status: int,
     expected_detail: str,
 ) -> None:
-    _configure_dependencies(application)
+    session, _ = _configure_dependencies(application)
     service = Mock(side_effect=error)
     monkeypatch.setattr(api, "execute_webhook_delivery", service)
 
@@ -204,13 +215,17 @@ def test_preparation_error_mapping(
     assert response.status_code == expected_status
     assert response.json() == {"detail": expected_detail}
     service.assert_called_once()
+    session.commit.assert_not_called()
+    session.refresh.assert_not_called()
+    session.rollback.assert_not_called()
+    session.close.assert_not_called()
 
 
 def test_invalid_uuid_returns_422_without_calling_service(
     application: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_dependencies(application)
+    session, _ = _configure_dependencies(application)
     service = Mock()
     monkeypatch.setattr(api, "execute_webhook_delivery", service)
 
@@ -219,6 +234,10 @@ def test_invalid_uuid_returns_422_without_calling_service(
 
     assert response.status_code == 422
     service.assert_not_called()
+    session.commit.assert_not_called()
+    session.refresh.assert_not_called()
+    session.rollback.assert_not_called()
+    session.close.assert_not_called()
 
 
 def test_settings_dependency_is_lazy_and_cached(
