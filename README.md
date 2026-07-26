@@ -49,16 +49,21 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
-- Synchronous application service that executes one webhook delivery
+- Synchronous `execute_webhook_delivery` execution service that uses a caller-owned transaction
 - Injectable HTTP client abstraction with exactly one HTTP POST per execution
 - Explicit request timeout with redirects disabled
 - Delivery result classification: 2xx is `succeeded`; non-2xx and transport errors are `failed`
-- Completed `WebhookDeliveryAttempt` persistence with the next number for its event
+- The execution service creates, adds, and flushes one completed `WebhookDeliveryAttempt` with the
+  next number for its event; it does not commit, roll back, or refresh
 - Attempt records include the target URL snapshot, HTTP status, normalized error, duration, and
   timezone-aware attempt timestamp
 - Public manual `POST /webhook-events/{event_id}/delivery-attempts` endpoint that synchronously
-  executes exactly one delivery and returns the persisted attempt
-- HTTP 201 for both persisted `succeeded` and `failed` delivery attempts
+  executes exactly one delivery, commits once, refreshes the attempt after commit, and returns it
+- HTTP 201 for both committed `succeeded` and `failed` delivery attempts
+- Preparation errors occur before HTTP execution and before a delivery attempt is created
+- The caller-owned transaction boundary can let a future worker atomically persist an attempt and
+  a delivery job transition; attempt-plus-job completion is not implemented, and current delivery
+  execution does not update `WebhookDeliveryJob`
 - Configurable positive, finite `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` application setting, with a
   default of 10.0 seconds
 - Configurable total attempt limit and exponential-backoff base and maximum delay settings
@@ -112,18 +117,23 @@ flowchart LR
     Event --> PostgreSQL
     Job --> PostgreSQL
     App --> AttemptPOST["FastAPI<br/>POST /webhook-events/{event_id}/delivery-attempts"]
-    AttemptPOST -->|"Session + WebhookHttpClient + timeout"| Execute["execute_webhook_delivery"]
+    AttemptPOST -->|"session + HTTP client + timeout"| Execute["execute_webhook_delivery"]
+    AttemptPOST -->|"provides caller-owned transaction"| DeliverySession["SQLAlchemy session"]
     App --> AttemptGET["FastAPI<br/>GET /webhook-events/{event_id}/delivery-attempts"]
     AttemptGET --> AttemptSession["SQLAlchemy session"]
     AttemptSession -->|"checks existing WebhookEvent"| Event
     AttemptSession -->|"reads stored completed attempts"| Attempt["WebhookDeliveryAttempt"]
     Attempt --> PostgreSQL
     Execute --> Prepare["prepare_webhook_delivery"]
-    Prepare -->|"reads WebhookEvent and WebhookEndpoint"| Session
+    Prepare -->|"reads WebhookEvent and WebhookEndpoint"| DeliverySession
     Execute --> HTTPClient["WebhookHttpClient"]
     HTTPClient -->|"exactly one HTTP POST"| Target["Endpoint target URL"]
     Target --> Classification["Classify delivery result"]
-    Classification -->|"persists one completed attempt"| Attempt
+    Classification -->|"creates one completed attempt"| Attempt
+    Execute -->|"add + flush"| DeliverySession
+    DeliverySession --> Attempt
+    AttemptPOST -->|"one commit"| DeliverySession
+    AttemptPOST -->|"refresh after commit"| Attempt
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -133,11 +143,11 @@ The event route uses one caller-owned transaction to flush a `WebhookEvent` and 
 due, but the route does not claim it or execute delivery.
 
 The manual POST route supplies the database session, HTTP client, and configured timeout to
-`execute_webhook_delivery`. The service performs one outgoing HTTP POST and persists the completed
-attempt in PostgreSQL. The GET route reads those stored attempts. The synchronous claim service is
-not invoked by the API or a worker, so it is not shown as an active runtime flow. No worker exists,
-and the pure retry policy is not connected to the job lifecycle. Detailed behavior is documented
-in [Database and
+`execute_webhook_delivery`. The execution service performs one outgoing HTTP POST, creates the
+completed attempt, and adds and flushes it in the caller-owned transaction. The manual route owns
+that transaction: it commits the attempt exactly once and then refreshes it. The GET route remains
+read-only. The manual route does not invoke the claim service, the retry policy is not connected to
+the delivery job lifecycle, and no worker exists. Detailed behavior is documented in [Database and
 migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
 documentation](docs/api/index.md).
 

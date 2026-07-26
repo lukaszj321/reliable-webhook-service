@@ -54,8 +54,13 @@ The endpoint synchronously performs exactly one outgoing JSON `POST`:
 The endpoint accepts no request body and no timeout query parameter. Clients cannot override the
 configured timeout through the request.
 
-Creating an event through `POST /webhook-events` only stores the event. It does not invoke manual
-delivery automatically.
+`POST /webhook-events` atomically stores one `WebhookEvent` and one associated `pending`
+`WebhookDeliveryJob`. It does not invoke the manual delivery endpoint, perform HTTP, or create a
+`WebhookDeliveryAttempt`.
+
+For manual delivery, the execution service adds and flushes the completed attempt in the
+caller-owned transaction. The manual route then performs one commit, refreshes the attempt after
+the commit, and returns the response.
 
 ## Attempt numbering
 
@@ -109,7 +114,9 @@ Example failed attempt after an HTTP 503 response:
 }
 ```
 
-Both responses use HTTP 201 because a completed attempt was persisted successfully.
+Both responses use HTTP 201 because the outgoing request was executed and the manual route
+committed a completed attempt. Its outcome can be either `succeeded` or `failed`; HTTP 201 does not
+mean that the webhook was delivered successfully.
 
 ## Delivery outcomes
 
@@ -137,6 +144,8 @@ Preparation errors happen before the outgoing request and do not create a delive
 
 The missing-endpoint response is part of the endpoint contract, although normal public event
 creation requires an existing endpoint.
+
+Unexpected database errors are not translated into one of these documented domain errors.
 
 ## Listing endpoint
 
@@ -221,7 +230,10 @@ An invalid UUID returns FastAPI HTTP 422 with its standard validation payload.
 
 - Delivery is not triggered automatically after event creation.
 - The POST endpoint is manual execution, not replay.
-- Retry and backoff are not implemented.
+- Retry policy and backoff calculation exist, but the manual endpoint does not invoke them.
+- A failed attempt does not reschedule its delivery job, and no automatic next attempt is executed.
+- Attempt-plus-job completion is not implemented as one transaction.
+- Exactly-once delivery is not provided.
 - Replay is not implemented.
 - Background processing is not implemented.
 - Pagination and filtering are not implemented for GET.

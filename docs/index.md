@@ -20,16 +20,18 @@ Read the documentation in this order:
   migrations, atomic event and job transactions, the current schema, and delivery job claiming
   with `SKIP LOCKED`.
 - [Webhook delivery execution](delivery-execution.md) — public manual execution, retry decisions,
-  delivery job claiming infrastructure, attempt persistence, and the separation between job
-  creation, claiming, and delivery execution.
+  delivery job claiming infrastructure, and caller-owned transaction semantics in which the
+  execution service flushes an attempt and the manual route commits it, without combined job
+  completion.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
   listing behavior.
 - [Webhook event API](api/webhook-events.md) — event validation, atomic event and pending job
   persistence, the event-only response, and error behavior.
-- [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`
-  and read-only listing with `GET`, including outcomes, ordering, and error responses.
+- [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`,
+  including the manual route commit and unchanged completed-attempt response, plus read-only
+  listing with `GET`, outcomes, ordering, and error responses.
 
 ## Common tasks
 
@@ -48,6 +50,7 @@ Read the documentation in this order:
 - [Review transaction ownership](database.md#transaction-ownership)
 - [Review SKIP LOCKED concurrency semantics](database.md#postgresql-locking)
 - [Review delivery execution flow](delivery-execution.md#current-execution-model)
+- [Review delivery transaction ownership](delivery-execution.md#transaction-ownership)
 - [Review delivery result classification](delivery-execution.md#result-classification)
 - [Review attempt numbering](delivery-execution.md#attempt-numbering)
 - [Review delivery limitations](delivery-execution.md#current-limitations)
