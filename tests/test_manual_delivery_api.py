@@ -178,6 +178,75 @@ def test_failed_attempt_returns_201(
     ]
 
 
+def test_commit_error_propagates_without_refresh(
+    application: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, http_client = _configure_dependencies(application)
+    attempt = _attempt(
+        outcome="succeeded",
+        response_status_code=204,
+        error_message=None,
+    )
+    service = Mock(return_value=attempt)
+    commit_error = RuntimeError("commit failed")
+    session.commit.side_effect = commit_error
+    monkeypatch.setattr(api, "execute_webhook_delivery", service)
+
+    with TestClient(application) as client:
+        with pytest.raises(RuntimeError, match="^commit failed$") as error_info:
+            client.post(f"/webhook-events/{EVENT_ID}/delivery-attempts")
+
+    assert error_info.value is commit_error
+    service.assert_called_once_with(
+        session,
+        event_id=EVENT_ID,
+        http_client=http_client,
+        timeout_seconds=2.5,
+    )
+    session.commit.assert_called_once_with()
+    session.refresh.assert_not_called()
+    session.rollback.assert_not_called()
+    session.close.assert_not_called()
+    assert session.mock_calls == [call.commit()]
+
+
+def test_refresh_error_propagates_after_one_commit(
+    application: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, http_client = _configure_dependencies(application)
+    attempt = _attempt(
+        outcome="succeeded",
+        response_status_code=204,
+        error_message=None,
+    )
+    service = Mock(return_value=attempt)
+    refresh_error = RuntimeError("refresh failed")
+    session.refresh.side_effect = refresh_error
+    monkeypatch.setattr(api, "execute_webhook_delivery", service)
+
+    with TestClient(application) as client:
+        with pytest.raises(RuntimeError, match="^refresh failed$") as error_info:
+            client.post(f"/webhook-events/{EVENT_ID}/delivery-attempts")
+
+    assert error_info.value is refresh_error
+    service.assert_called_once_with(
+        session,
+        event_id=EVENT_ID,
+        http_client=http_client,
+        timeout_seconds=2.5,
+    )
+    session.commit.assert_called_once_with()
+    session.refresh.assert_called_once_with(attempt)
+    session.rollback.assert_not_called()
+    session.close.assert_not_called()
+    assert session.mock_calls == [
+        call.commit(),
+        call.refresh(attempt),
+    ]
+
+
 @pytest.mark.parametrize(
     ("error", "expected_status", "expected_detail"),
     [

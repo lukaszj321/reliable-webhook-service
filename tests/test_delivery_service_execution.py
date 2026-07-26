@@ -1,10 +1,12 @@
 import json
 import uuid
 from datetime import UTC, datetime
+from unittest.mock import Mock, call
 
 import httpx2
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import SessionFactory
 from reliable_webhook_service.delivery_http import Httpx2WebhookHttpClient
@@ -563,6 +565,66 @@ def test_execute_delivery_uses_non_negative_duration() -> None:
     finally:
         _cleanup_records(
             attempt_ids=attempt_ids,
+            event_ids=[event_id],
+            endpoint_ids=[endpoint_id],
+        )
+
+
+def test_execute_delivery_propagates_flush_error_without_transaction_control() -> None:
+    marker = uuid.uuid4()
+    endpoint_id = uuid.uuid4()
+    event_id = uuid.uuid4()
+    target_url = f"https://example.test/delivery-execution/{marker}/flush-error"
+    requests: list[httpx2.Request] = []
+    flush_error = RuntimeError("flush failed")
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(204)
+
+    try:
+        _persist_endpoint_and_event(
+            endpoint_id=endpoint_id,
+            event_id=event_id,
+            marker=marker,
+            target_url=target_url,
+            payload={"marker": str(marker), "scenario": "flush-error"},
+        )
+        transport = httpx2.MockTransport(handler)
+        with httpx2.Client(transport=transport) as client, SessionFactory() as real_session:
+            session = Mock(spec=Session, wraps=real_session)
+            session.flush.side_effect = flush_error
+
+            with pytest.raises(RuntimeError, match="^flush failed$") as error_info:
+                execute_webhook_delivery(
+                    session,
+                    event_id=event_id,
+                    http_client=Httpx2WebhookHttpClient(client),
+                    timeout_seconds=5.0,
+                    utc_now=lambda: datetime(2026, 7, 25, 10, 8, tzinfo=UTC),
+                    monotonic_ns=iter([1_000_000_000, 1_010_000_000]).__next__,
+                )
+
+            assert error_info.value is flush_error
+            session.add.assert_called_once()
+            added_attempt = session.add.call_args.args[0]
+            assert isinstance(added_attempt, WebhookDeliveryAttempt)
+            session.flush.assert_called_once_with()
+            assert session.method_calls[-2:] == [
+                call.add(added_attempt),
+                call.flush(),
+            ]
+            session.commit.assert_not_called()
+            session.rollback.assert_not_called()
+            session.refresh.assert_not_called()
+            session.close.assert_not_called()
+            assert len(requests) == 1
+            real_session.rollback()
+
+        assert _attempt_ids_for_event(event_id) == []
+    finally:
+        _cleanup_records(
+            attempt_ids=[],
             event_ids=[event_id],
             endpoint_ids=[endpoint_id],
         )
