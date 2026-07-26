@@ -23,10 +23,14 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Alembic migrations and a Docker Compose PostgreSQL service
 - `WebhookEndpoint` ORM model and `webhook_endpoints` table
 - `POST /webhook-endpoints` and `GET /webhook-endpoints`
-- Webhook event creation API through `POST /webhook-events`
-- Pydantic request validation for webhook events
-- PostgreSQL JSONB persistence linked to an existing `WebhookEndpoint`
-- HTTP 404 response when the referenced webhook endpoint does not exist
+- `POST /webhook-events` validates a webhook event and atomically creates one `WebhookEvent` and
+  one associated `pending` `WebhookDeliveryJob` in a caller-owned transaction
+- The route commits the event and job together once; `next_attempt_at` represents the same instant
+  as the server-generated `event.created_at`
+- PostgreSQL JSONB event persistence linked to an existing `WebhookEndpoint`; inactive endpoints
+  are accepted, while a missing endpoint returns HTTP 404 without creating either record
+- The event response still contains only the event; creating its durable job does not execute HTTP,
+  create a delivery attempt, invoke claiming or retry logic, or start a worker
 - `WebhookDeliveryJob` ORM model and `webhook_delivery_jobs` PostgreSQL table for durable processing
   state linked to `WebhookEvent`, with at most one job per event
 - Delivery job statuses: `pending`, `processing`, `succeeded`, and `dead_letter`
@@ -40,9 +44,8 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Caller-owned claim transaction: the service flushes changes but does not commit or roll back
 - Real PostgreSQL tests with two independent sessions confirm locked jobs are skipped and claims do
   not overlap
-- Event creation does not create jobs automatically. No worker, polling loop, automatic claim
-  invocation, automatic HTTP execution, completion handling, automatic retry scheduling, stale
-  `processing` recovery, or public job API exists
+- No worker, polling loop, automatic claim invocation, automatic HTTP execution, completion
+  handling, automatic retry rescheduling, stale `processing` recovery, or public job API exists
 - `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
@@ -75,7 +78,7 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 The following capabilities are planned but are not currently implemented:
 
 - Asynchronous delivery processing
-- Automatic retry execution and delivery-job scheduling
+- Automatic retry execution and delivery-job rescheduling after failed attempts
 - Idempotency
 - Automatic delivery execution after event creation
 - Manual replay
@@ -100,9 +103,14 @@ flowchart LR
     Endpoint --> PostgreSQL["PostgreSQL"]
     App --> EventAPI["FastAPI<br/>POST /webhook-events"]
     EventAPI -->|"validates request"| EventValidation["Pydantic validation"]
-    EventAPI --> Session
-    Session --> Event["WebhookEvent"]
+    EventValidation --> EventService["create_webhook_event_with_delivery_job"]
+    EventService -->|"caller-owned transaction"| EventSession["SQLAlchemy session"]
+    EventSession -->|"add + flush"| Event["WebhookEvent"]
+    Event -->|"event.id + event.created_at"| Job["WebhookDeliveryJob<br/>pending"]
+    EventSession -->|"add + flush"| Job
+    EventAPI -->|"one commit after both flushes"| EventSession
     Event --> PostgreSQL
+    Job --> PostgreSQL
     App --> AttemptPOST["FastAPI<br/>POST /webhook-events/{event_id}/delivery-attempts"]
     AttemptPOST -->|"Session + WebhookHttpClient + timeout"| Execute["execute_webhook_delivery"]
     App --> AttemptGET["FastAPI<br/>GET /webhook-events/{event_id}/delivery-attempts"]
@@ -119,14 +127,17 @@ flowchart LR
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
+The event route uses one caller-owned transaction to flush a `WebhookEvent` and its `pending`
+`WebhookDeliveryJob`, then commits both together. The job uses the generated `event.id`, and its
+`next_attempt_at` represents the same instant as `event.created_at`. This makes the job immediately
+due, but the route does not claim it or execute delivery.
+
 The manual POST route supplies the database session, HTTP client, and configured timeout to
 `execute_webhook_delivery`. The service performs one outgoing HTTP POST and persists the completed
-attempt in PostgreSQL. The GET route reads those stored attempts. `POST /webhook-events` only
-stores an event and does not trigger delivery automatically. The durable delivery job schema exists
-with a synchronous delivery job claiming application service. The claim service is not invoked by
-the API or a worker, so it is not shown as an active runtime flow. Jobs are not created
-automatically, and no worker exists. The pure retry policy and claim service both await integration
-with a future worker. Detailed behavior is documented in [Database and
+attempt in PostgreSQL. The GET route reads those stored attempts. The synchronous claim service is
+not invoked by the API or a worker, so it is not shown as an active runtime flow. No worker exists,
+and the pure retry policy is not connected to the job lifecycle. Detailed behavior is documented
+in [Database and
 migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
 documentation](docs/api/index.md).
 
@@ -171,12 +182,13 @@ See the [Development setup guide](docs/development.md) for environment configura
 | GET | `/health` | Check application availability |
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
-| POST | `/webhook-events` | Store an event for an existing webhook endpoint |
+| POST | `/webhook-events` | Store an event and atomically create its pending delivery job |
 | POST | `/webhook-events/{event_id}/delivery-attempts` | Manually execute one synchronous delivery and return the persisted attempt |
 | GET | `/webhook-events/{event_id}/delivery-attempts` | List stored completed delivery attempts for one event |
 
-Manual delivery is explicit. Storing an event through `POST /webhook-events` does not invoke the
-delivery endpoint automatically.
+The pending job is a durable work item and is not included in the event response. Manual delivery
+remains explicit: `POST /webhook-events` does not invoke the delivery endpoint or execute HTTP
+automatically.
 
 [API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md) | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md)
 
@@ -200,7 +212,7 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 |---|---|
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
-| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, ORM behavior, delivery job claiming, and `SKIP LOCKED` transaction semantics |
+| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, and `SKIP LOCKED` transaction semantics |
 | [Webhook delivery execution](docs/delivery-execution.md) | Manual execution flow, result outcomes, retry decisions, delivery job claiming infrastructure, transaction ownership, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |

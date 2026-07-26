@@ -25,7 +25,9 @@ Delivery execution is synchronous. One service call performs at most one HTTP re
 request that is actually executed ends with an attempt to persist one completed delivery attempt.
 The public manual POST route calls that service with a database session, HTTP client, and configured
 timeout. The service does not retry requests, and creating a webhook event does not trigger delivery
-automatically.
+automatically. Event creation atomically persists one `WebhookEvent` and one immediately due
+`pending` `WebhookDeliveryJob`, but it does not call `execute_webhook_delivery`, perform HTTP, or
+create a `WebhookDeliveryAttempt`.
 
 ## Preparation and validation
 
@@ -134,6 +136,10 @@ result deterministic, and a pending `next_attempt_at` is normalized to UTC.
 continues to perform exactly one manual request. The retry policy remains pure decision logic.
 These components are not connected by a worker.
 
+The normal `POST /webhook-events` path supplies the initial `pending` jobs. Their
+`next_attempt_at` represents the same instant as `event.created_at`, so they are immediately due
+for this claim service. Nothing invokes the claim service automatically.
+
 The claim flow is:
 
 1. the caller passes a SQLAlchemy `Session`, a timezone-aware `claimed_at`, and a positive integer
@@ -156,7 +162,8 @@ not overlap. This is internal infrastructure, not a public endpoint.
 
 A future worker should commit a claim before invoking `execute_webhook_delivery`. It should not
 hold the claim transaction or row-level locks while waiting for an external HTTP request. No worker
-currently performs this sequence, and claiming alone does not execute or complete a delivery.
+currently performs this sequence. Claiming alone does not execute HTTP, create an attempt, or
+perform a completion transition.
 
 ## Error handling
 
@@ -190,14 +197,16 @@ Preparation errors occur before an outgoing request and do not create an attempt
 | `WebhookEndpointNotFoundError` | 409 | `Webhook endpoint not found` |
 | `InactiveWebhookEndpointError` | 409 | `Webhook endpoint is inactive` |
 
-`POST /webhook-events` only stores an event. It does not call the delivery service or invoke the
-manual delivery endpoint automatically.
+`POST /webhook-events` atomically stores an event and its initial `pending` delivery job. It does
+not call the delivery service or invoke the manual delivery endpoint automatically.
 
 ## Current limitations
 
 - No automatic delivery trigger
 - The delivery job claiming service exists, but no worker or polling loop invokes it
-- Creating a webhook event does not create a delivery job automatically
+- No worker consumes newly created pending jobs
+- No automatic claim invocation
+- No automatic HTTP execution for newly created jobs
 - Claiming does not execute HTTP or perform a completion transition
 - Retry policy and backoff calculation exist, but they are not connected to claiming and no
   automatic retry execution invokes them
