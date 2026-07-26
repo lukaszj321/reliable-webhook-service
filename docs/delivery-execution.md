@@ -13,6 +13,7 @@ service and returns one persisted `WebhookDeliveryAttempt`.
 - [Attempt persistence](#attempt-persistence)
 - [Attempt numbering](#attempt-numbering)
 - [Retry decision policy](#retry-decision-policy)
+- [Delivery job claiming](#delivery-job-claiming)
 - [Error handling](#error-handling)
 - [Invocation](#invocation)
 - [Current limitations](#current-limitations)
@@ -126,6 +127,37 @@ grow up to the 300-second cap, and very large attempt numbers are safely capped.
 randomness, sleep, or implicit current-time lookup. Passing `decision_at` explicitly makes the
 result deterministic, and a pending `next_attempt_at` is normalized to UTC.
 
+## Delivery job claiming
+
+`claim_due_webhook_delivery_jobs` is a synchronous internal application service separate from
+`execute_webhook_delivery`. Claiming does not perform HTTP, while `execute_webhook_delivery`
+continues to perform exactly one manual request. The retry policy remains pure decision logic.
+These components are not connected by a worker.
+
+The claim flow is:
+
+1. the caller passes a SQLAlchemy `Session`, a timezone-aware `claimed_at`, and a positive integer
+   batch `limit`;
+2. the service selects due `pending` jobs in deterministic `next_attempt_at`, `created_at`, and
+   `id` order;
+3. PostgreSQL locks the selected rows through `FOR UPDATE SKIP LOCKED`;
+4. the service changes each selected job to `processing` and explicitly sets `updated_at` to the
+   normalized UTC claim time;
+5. the service flushes the changes;
+6. the caller commits or rolls back the caller-owned transaction.
+
+The service does not create or close a session, read the system time, commit, or roll back. The
+row-level locks remain active until the caller ends the transaction. A commit persists the claim;
+a rollback restores the previous committed `pending` state.
+
+With concurrent claimers, session A can lock the first due job while session B skips it and claims
+later unlocked due jobs. Real PostgreSQL integration tests verify that the two returned ID sets do
+not overlap. This is internal infrastructure, not a public endpoint.
+
+A future worker should commit a claim before invoking `execute_webhook_delivery`. It should not
+hold the claim transaction or row-level locks while waiting for an external HTTP request. No worker
+currently performs this sequence, and claiming alone does not execute or complete a delivery.
+
 ## Error handling
 
 - Preparation errors occur before the request and do not create an attempt.
@@ -164,9 +196,13 @@ manual delivery endpoint automatically.
 ## Current limitations
 
 - No automatic delivery trigger
-- No background processing
-- Retry policy and backoff calculation exist, but no worker or automatic retry execution invokes
-  them
+- The delivery job claiming service exists, but no worker or polling loop invokes it
+- Creating a webhook event does not create a delivery job automatically
+- Claiming does not execute HTTP or perform a completion transition
+- Retry policy and backoff calculation exist, but they are not connected to claiming and no
+  automatic retry execution invokes them
+- No stale `processing` recovery, lease, or heartbeat
+- No background worker
 - No replay
 - No idempotency
 - No concurrent attempt-number allocation

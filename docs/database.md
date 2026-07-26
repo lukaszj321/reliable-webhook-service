@@ -9,6 +9,7 @@ PostgreSQL stores the application's persistent data, and Alembic manages the dat
 - [Alembic migrations](#alembic-migrations)
 - [Current revision](#current-revision)
 - [Database schema](#database-schema)
+- [Delivery job claiming](#delivery-job-claiming)
 - [ORM behavior](#orm-behavior)
 - [Validation boundary](#validation-boundary)
 - [Navigation](#navigation)
@@ -141,8 +142,9 @@ represents durable non-terminal or terminal processing state, but its existence 
 webhook.
 
 The event API does not create job records automatically, and there is no public API for creating,
-reading, or modifying jobs. Worker execution, claiming, polling, retry scheduling, and replay are
-not implemented.
+reading, or modifying jobs. An internal synchronous application service can claim existing due
+jobs. No worker, polling loop, automatic delivery execution, completion handling, retry scheduling,
+or replay is implemented.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -176,9 +178,10 @@ not implemented.
 - `succeeded` is terminal and requires `next_attempt_at` to be `NULL`.
 - `dead_letter` is terminal and requires `next_attempt_at` to be `NULL`.
 
-The model does not implement transitions between these states, and the database does not enforce a
-state machine. No worker exists. `next_attempt_at` is currently a stored value, not an actively
-executed schedule.
+The database does not enforce a complete state machine. An application service implements the
+specific `pending` to `processing` claim transition, while all other transitions and the worker
+lifecycle remain unimplemented. No worker exists, and `next_attempt_at` is not polled or executed
+automatically.
 
 ### webhook_delivery_attempts
 
@@ -247,8 +250,8 @@ structured exception JSON, credentials, or signing secrets.
 
 `target_url` is stored on each attempt as a snapshot of the URL used for that specific attempt.
 A future change to `WebhookEndpoint.target_url` should not change the historical value stored in an
-existing attempt record. The current application does not yet perform delivery or automatically
-create these records.
+existing attempt record. The public manual endpoint can perform one delivery and create an attempt,
+but event creation does not do so automatically.
 
 #### Deletion behavior
 
@@ -270,6 +273,69 @@ deleted, its job is removed automatically.
 Deleting a job does not delete its event, and deleting an event does not delete its endpoint. If an
 event has both attempts and a job, the attempts still block deletion of the event. After the
 attempts are removed, deleting the event also deletes its job through the database cascade.
+
+## Delivery job claiming
+
+The synchronous `claim_due_webhook_delivery_jobs` application service claims existing delivery
+jobs through a caller-provided SQLAlchemy `Session`. It does not create a session or use
+`SessionFactory`, and it does not read the system time. The caller supplies a timezone-aware
+`claimed_at`, which the service normalizes to UTC, and a real integer `limit` greater than or equal
+to 1. Boolean limits are rejected. The service returns a list of `WebhookDeliveryJob` ORM objects,
+or an empty list when no job is eligible.
+
+### Eligibility and ordering
+
+A job is eligible only when all these conditions hold:
+
+- `status` is `pending`;
+- `next_attempt_at` is not `NULL`;
+- `next_attempt_at` is less than or equal to the normalized `claimed_at`.
+
+The single selection query orders eligible jobs by `next_attempt_at`, then `created_at`, then `id`,
+all ascending. The caller's `limit` bounds the claimed batch. The service does not perform a
+separate unlocked read before selecting and locking the jobs.
+
+### PostgreSQL locking
+
+The selection uses PostgreSQL `SELECT FOR UPDATE SKIP LOCKED`. PostgreSQL applies row-level locks to
+the selected jobs in the current transaction. If session A already holds a lock on the first due
+job, session B skips that row and can claim later unlocked due jobs. This prevents concurrent
+claimers from receiving the same selected job while allowing other eligible work to remain
+claimable.
+
+Integration tests exercise this behavior against real PostgreSQL with two independent sessions.
+They confirm that the returned ID sets do not overlap and that the second session claims other due
+jobs instead of emulating locking in Python.
+
+### State transition
+
+Each claimed job changes from `pending` to `processing`. Its `id`, `event_id`, `created_at`, and
+`next_attempt_at` remain unchanged. The service explicitly sets `updated_at` to the supplied
+`claimed_at` normalized to UTC. Preserving the non-null `next_attempt_at` keeps the claimed
+`processing` row consistent with the existing database constraint.
+
+### Transaction ownership
+
+The caller owns the transaction. The service executes `SELECT FOR UPDATE SKIP LOCKED`, changes the
+selected ORM objects, and flushes those changes, but it does not commit, roll back, or close the
+session. Row-level locks remain active until the caller commits or rolls back:
+
+- commit persists the `processing` state;
+- rollback restores the previous committed `pending` state.
+
+A future worker should commit the claim before starting external HTTP. It should not keep the
+transaction and row-level locks open for the duration of an HTTP request. No worker currently calls
+the claim service or performs this lifecycle automatically.
+
+### Current limitations
+
+- No worker or polling loop invokes the claim service.
+- Creating a webhook event does not create a delivery job automatically.
+- Claiming does not execute HTTP or complete a job.
+- The retry policy is not connected to job claiming or automatic retry scheduling.
+- No stale `processing` recovery exists.
+- No lease, heartbeat, or lock-timeout lifecycle exists.
+- No public delivery job API exists.
 
 ## ORM behavior
 
@@ -307,10 +373,14 @@ through SQLAlchemy's ORM configuration.
   `now()`.
 - `updated_at` has no `onupdate`, `server_onupdate`, or trigger, so the model does not update it
   automatically after changes.
+- The internal claim service explicitly sets `updated_at` to its normalized `claimed_at` and
+  preserves `next_attempt_at`.
+- The claim service uses the caller's session and flushes the `pending` to `processing` transition,
+  but it does not commit, roll back, or close the session.
 - A unique constraint allows at most one job per event.
 - Deleting an event removes its job through database `ON DELETE CASCADE`.
 - `SessionFactory` continues to use `expire_on_commit=False`.
-- No service layer, public job API, or automatic job creation currently exists.
+- No public job API or automatic job creation currently exists.
 
 **WebhookDeliveryAttempt**
 
@@ -325,9 +395,9 @@ through SQLAlchemy's ORM configuration.
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` lists stored completed attempts for
   one existing event without creating or modifying them. A top-level
   `GET /webhook-delivery-attempts` endpoint does not exist.
-- Synchronous execution of one delivery exists as an application service. It is not triggered
-  automatically after event creation, and no public HTTP endpoint starts delivery. Workers,
-  background processing, retry, backoff, and replay are not implemented.
+- Synchronous execution of one delivery exists as an application service and through the public
+  manual POST endpoint. It is not triggered automatically after event creation. Workers,
+  background processing, automatic retry execution, and replay are not implemented.
 
 **Shared persistence configuration**
 
@@ -353,9 +423,12 @@ endpoint currently accepts delivery attempt data. See
 [Webhook event API](api/webhook-events.md) for the complete request and response behavior.
 
 `WebhookDeliveryJob` has no public Pydantic request schema, and the public API does not accept job
-data. PostgreSQL constraints protect `status` and `next_attempt_at` during ORM persistence. The
-schema does not implement state transitions, retry counts, locking, or claiming, and creating a
-`WebhookEvent` does not create a `WebhookDeliveryJob`.
+data. PostgreSQL constraints protect `status` and `next_attempt_at` during ORM persistence. Delivery
+job claiming is an internal application service: it validates that `limit` is a real integer of at
+least 1, rejects naive `claimed_at` values, normalizes valid timestamps to UTC, and implements only
+the `pending` to `processing` transition. Row locking is query behavior, not a schema constraint.
+The database does not enforce a complete state machine, and creating a `WebhookEvent` still does
+not create a `WebhookDeliveryJob`.
 
 ## Navigation
 
