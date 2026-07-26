@@ -16,6 +16,10 @@ from reliable_webhook_service.dependencies import (
     SettingsDependency,
     WebhookHttpClientDependency,
 )
+from reliable_webhook_service.event_service import (
+    WebhookEndpointNotFoundError as EventWebhookEndpointNotFoundError,
+)
+from reliable_webhook_service.event_service import create_webhook_event_with_delivery_job
 from reliable_webhook_service.models import (
     WebhookDeliveryAttempt,
     WebhookEndpoint,
@@ -84,19 +88,19 @@ def create_webhook_event(
     payload: WebhookEventCreate,
     session: SessionDependency,
 ) -> WebhookEvent:
-    endpoint = session.get(WebhookEndpoint, payload.endpoint_id)
-    if endpoint is None:
+    try:
+        event = create_webhook_event_with_delivery_job(
+            session,
+            endpoint_id=payload.endpoint_id,
+            event_type=payload.event_type,
+            payload=payload.payload,
+        )
+    except EventWebhookEndpointNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Webhook endpoint not found",
-        )
+            detail=str(error),
+        ) from error
 
-    event = WebhookEvent(
-        endpoint_id=payload.endpoint_id,
-        event_type=payload.event_type,
-        payload=payload.payload,
-    )
-    session.add(event)
     session.commit()
     session.refresh(event)
     return event

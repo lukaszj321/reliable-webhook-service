@@ -9,6 +9,7 @@ PostgreSQL stores the application's persistent data, and Alembic manages the dat
 - [Alembic migrations](#alembic-migrations)
 - [Current revision](#current-revision)
 - [Database schema](#database-schema)
+- [Atomic event and delivery job creation](#atomic-event-and-delivery-job-creation)
 - [Delivery job claiming](#delivery-job-claiming)
 - [ORM behavior](#orm-behavior)
 - [Validation boundary](#validation-boundary)
@@ -111,7 +112,8 @@ The `webhook_endpoints` table stores configurations for webhook destination addr
 ### webhook_events
 
 The `webhook_events` table stores events associated with an existing webhook endpoint
-configuration. Persistence of these records does not provide webhook delivery.
+configuration. The event creation API persists each event with one initial delivery job, but this
+persistence does not execute webhook delivery.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -141,10 +143,10 @@ The `webhook_delivery_jobs` table stores durable processing state associated wit
 represents durable non-terminal or terminal processing state, but its existence does not execute a
 webhook.
 
-The event API does not create job records automatically, and there is no public API for creating,
-reading, or modifying jobs. An internal synchronous application service can claim existing due
-jobs. No worker, polling loop, automatic delivery execution, completion handling, retry scheduling,
-or replay is implemented.
+The event API creates one initial `pending` job atomically with each accepted event. There is no
+public API for creating, reading, or modifying jobs. An internal synchronous application service
+can claim due jobs, but no worker, polling loop, automatic claim invocation, automatic delivery
+execution, completion handling, retry rescheduling, or replay is implemented.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -274,6 +276,62 @@ Deleting a job does not delete its event, and deleting an event does not delete 
 event has both attempts and a job, the attempts still block deletion of the event. After the
 attempts are removed, deleting the event also deletes its job through the database cascade.
 
+## Atomic event and delivery job creation
+
+`POST /webhook-events` uses `create_webhook_event_with_delivery_job` to prepare one
+`WebhookEvent` and one associated `WebhookDeliveryJob` in the same caller-owned transaction.
+
+### Service boundary
+
+The service receives the caller's SQLAlchemy `Session` and checks the endpoint with
+`session.get(WebhookEndpoint, endpoint_id)`. A missing endpoint raises
+`WebhookEndpointNotFoundError` before either record is added. An inactive endpoint is accepted and
+receives the same initial `pending` job as an active endpoint. The service is independent of
+FastAPI.
+
+### Persistence sequence
+
+The service performs this sequence:
+
+1. creates the `WebhookEvent`;
+2. calls `session.add(event)`;
+3. calls `session.flush()`;
+4. obtains the generated `event.id` and server-generated `event.created_at`;
+5. creates the `WebhookDeliveryJob`;
+6. sets `event_id=event.id`;
+7. sets `status=pending`;
+8. sets `next_attempt_at=event.created_at`;
+9. calls `session.add(job)`;
+10. calls `session.flush()`;
+11. returns the `WebhookEvent`.
+
+The two flushes send changes through the same transaction; they are not commits.
+
+### Transaction ownership
+
+The service does not commit, roll back, or close the caller's session. After both flushes, the API
+route performs one commit. Before that commit, another session sees neither the event nor its job.
+After the commit, both records become visible together. A caller rollback removes both uncommitted
+records.
+
+For this API path, a successful committed event therefore has its initial job. The database itself
+does not require every event to have a job: it enforces at most one job per event through
+`uq_webhook_delivery_jobs_event_id`, but it has no constraint requiring a job for every event.
+
+### Initial schedule
+
+The initial `next_attempt_at` represents the same instant as the server-generated
+`event.created_at`, so the new `pending` job is immediately due for
+`claim_due_webhook_delivery_jobs`. The service does not read a second application clock.
+PostgreSQL continues to manage the job's `created_at` and `updated_at` server defaults.
+
+### API boundary
+
+The public response contains only the `WebhookEvent`: `id`, `endpoint_id`, `event_type`, `payload`,
+and `created_at`. It does not expose the job, a job ID, job status, or `next_attempt_at`. No public
+delivery-job API exists, and creating the durable job does not execute delivery, create an attempt,
+invoke claiming, apply retry policy, or start a worker.
+
 ## Delivery job claiming
 
 The synchronous `claim_due_webhook_delivery_jobs` application service claims existing delivery
@@ -330,7 +388,7 @@ the claim service or performs this lifecycle automatically.
 ### Current limitations
 
 - No worker or polling loop invokes the claim service.
-- Creating a webhook event does not create a delivery job automatically.
+- Newly created pending jobs are not claimed or consumed automatically.
 - Claiming does not execute HTTP or complete a job.
 - The retry policy is not connected to job claiming or automatic retry scheduling.
 - No stale `processing` recovery exists.
@@ -357,8 +415,11 @@ through SQLAlchemy's ORM configuration.
 - The payload is stored as PostgreSQL `JSONB`.
 - The model has no `updated_at` column and no ORM relationship with `WebhookEndpoint`.
 - The foreign key does not provide cascade delete.
-- `POST /webhook-events` verifies the referenced endpoint and persists a `WebhookEvent` object.
+- `POST /webhook-events` verifies the referenced endpoint and prepares a `WebhookEvent` together
+  with one initial `pending` `WebhookDeliveryJob`.
 - An inactive endpoint can still accept an event through the creation API.
+- The event and job are flushed in one caller-owned transaction, and the route commits them
+  together once.
 - Alembic manages the `webhook_events` schema. The event creation API uses the existing schema, so
   it does not require a separate migration.
 
@@ -377,10 +438,12 @@ through SQLAlchemy's ORM configuration.
   preserves `next_attempt_at`.
 - The claim service uses the caller's session and flushes the `pending` to `processing` transition,
   but it does not commit, roll back, or close the session.
+- `create_webhook_event_with_delivery_job` creates the initial job from the flushed event ID and
+  timestamp without committing, rolling back, or closing the caller's session.
 - A unique constraint allows at most one job per event.
 - Deleting an event removes its job through database `ON DELETE CASCADE`.
 - `SessionFactory` continues to use `expire_on_commit=False`.
-- No public job API or automatic job creation currently exists.
+- No public job API, automatic claim invocation, or worker currently exists.
 
 **WebhookDeliveryAttempt**
 
@@ -427,8 +490,9 @@ data. PostgreSQL constraints protect `status` and `next_attempt_at` during ORM p
 job claiming is an internal application service: it validates that `limit` is a real integer of at
 least 1, rejects naive `claimed_at` values, normalizes valid timestamps to UTC, and implements only
 the `pending` to `processing` transition. Row locking is query behavior, not a schema constraint.
-The database does not enforce a complete state machine, and creating a `WebhookEvent` still does
-not create a `WebhookDeliveryJob`.
+The database does not enforce a complete state machine. The event creation service prepares one
+initial job for the API path, while the database only enforces that an event cannot have more than
+one job.
 
 ## Navigation
 

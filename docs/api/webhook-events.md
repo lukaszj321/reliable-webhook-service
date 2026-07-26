@@ -1,6 +1,7 @@
 # Webhook Event API
 
-This API stores webhook events for existing webhook endpoint configurations.
+This API stores webhook events for existing webhook endpoint configurations and atomically creates
+one initial `pending` delivery job for each accepted event. It does not execute the webhook.
 
 ## Contents
 
@@ -83,6 +84,9 @@ The endpoint returns HTTP `201 Created` with these fields:
 The application generates `id`. PostgreSQL assigns the timezone-aware `created_at` value and stores
 `payload` as `JSONB`. The returned `event_type` has already been trimmed.
 
+The associated delivery job is not part of the response. No public `job_id`, job status, or
+`next_attempt_at` field is returned.
+
 Example response:
 
 ```json
@@ -111,7 +115,7 @@ Example response:
 ## Error responses
 
 HTTP 404 means that the request contained a valid UUID, but no webhook endpoint with that ID exists.
-The response is exactly:
+Neither an event nor a delivery job is created. The response is exactly:
 
 ```json
 {
@@ -127,25 +131,44 @@ HTTP 422 indicates request validation failure. It is returned for:
 - a missing `endpoint_id`, `event_type`, or `payload` field;
 - a top-level `payload` that is a list, scalar value, or `null`.
 
+Validation failures occur before persistence, so they create neither an event nor a delivery job.
+
 ## Persistence behavior
 
-The handler first checks that the referenced `WebhookEndpoint` exists. It then creates a
-`WebhookEvent` and stores it through SQLAlchemy in PostgreSQL. The event references the endpoint
-through `endpoint_id`, and its JSON object is stored in the `JSONB` payload column. An endpoint whose
-`is_active` value is `false` can still accept an event.
+The persistence flow is:
 
-Creating an event does not send it to `target_url`, create a delivery attempt, or activate delivery,
-retry, or replay processing. See [Database and migrations](../database.md) for schema and persistence
-details.
+1. `create_webhook_event_with_delivery_job` checks the referenced `WebhookEndpoint`;
+2. it creates, adds, and flushes the `WebhookEvent`;
+3. the flush provides `event.id` and the server-generated `event.created_at`;
+4. it creates one `WebhookDeliveryJob` with `status=pending`;
+5. it sets `job.event_id=event.id` and `job.next_attempt_at=event.created_at`;
+6. it adds and flushes the job;
+7. the route performs one commit after both flushes.
+
+Both records use the same caller-owned transaction. Another session sees neither before the
+commit, and both become visible together afterward. A rollback before commit removes both
+uncommitted records. The two flushes are not separate commits.
+
+An endpoint whose `is_active` value is `false` can still accept an event and receive a pending job.
+Because `next_attempt_at` represents the same instant as `event.created_at`, the job is immediately
+due. Nothing invokes `claim_due_webhook_delivery_jobs` automatically.
+
+Creating the job does not send the payload to `target_url`, create a delivery attempt, invoke the
+claim service, apply retry policy, start a worker, or move the job to `processing`. See [Database
+and migrations](../database.md#atomic-event-and-delivery-job-creation) for transaction and
+persistence details.
 
 ## Non-goals and current limitations
 
 - General event listing through `GET /webhook-events` is not available. The only read operation
   nested under an event is the delivery attempt listing for one existing event.
-- `POST /webhook-events` stores the event but does not start delivery. One synchronous delivery can
-  be executed separately through the application service.
-- No public HTTP endpoint starts delivery.
-- Background processing, retry, idempotency, and replay are not implemented.
+- `POST /webhook-events` stores the event and pending job but does not start delivery or invoke
+  `POST /webhook-events/{event_id}/delivery-attempts`.
+- One synchronous delivery can be started explicitly through
+  `POST /webhook-events/{event_id}/delivery-attempts`.
+- No worker or automatic claim invocation exists.
+- Automatic retry execution, completion transitions, retry rescheduling, stale `processing`
+  recovery, idempotency, and replay are not implemented.
 - No payload size limit is configured.
 - Authentication is not implemented.
 

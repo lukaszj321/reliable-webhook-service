@@ -36,8 +36,10 @@ See [Webhook endpoint API](webhook-endpoints.md) for request, response, and vali
 
 ## Webhook event API
 
-`POST /webhook-events` validates a webhook event request and stores the event in PostgreSQL for an
-existing webhook endpoint. A request that references a missing endpoint returns HTTP 404.
+`POST /webhook-events` validates a webhook event request and atomically stores one `WebhookEvent`
+and one associated `pending` `WebhookDeliveryJob` in PostgreSQL. Its response still contains only
+the event. An inactive endpoint is accepted, while a request that references a missing endpoint
+returns HTTP 404 without creating either record. The route does not execute delivery.
 
 See [Webhook event API](webhook-events.md) for request, response, validation, persistence, and error
 details.
@@ -53,7 +55,8 @@ Available routes:
   one existing event. It returns an empty list when the event has no attempts and HTTP 404 when the
   event does not exist.
 
-Creating an event through `POST /webhook-events` does not invoke manual delivery automatically.
+Creating an event through `POST /webhook-events` creates its durable pending job but does not invoke
+manual delivery automatically.
 
 See [Webhook delivery attempt API](webhook-delivery-attempts.md) for response fields, ordering,
 manual execution behavior, outcomes, empty results, and errors.
