@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,13 +7,20 @@ from sqlalchemy import select
 
 from reliable_webhook_service.database import SessionFactory
 from reliable_webhook_service.main import app
-from reliable_webhook_service.models import JsonValue, WebhookEndpoint, WebhookEvent
+from reliable_webhook_service.models import (
+    JsonValue,
+    WebhookDeliveryAttempt,
+    WebhookDeliveryJob,
+    WebhookEndpoint,
+    WebhookEvent,
+)
 
 
 def test_create_webhook_event() -> None:
     marker = uuid.uuid4()
     endpoint_id: uuid.UUID | None = None
     event_id: uuid.UUID | None = None
+    job_id: uuid.UUID | None = None
     payload: dict[str, JsonValue] = {
         "order": {
             "id": str(marker),
@@ -93,6 +100,18 @@ def test_create_webhook_event() -> None:
         with SessionFactory() as session:
             stored_event = session.get(WebhookEvent, event_id)
             stored_endpoint = session.get(WebhookEndpoint, endpoint_id)
+            stored_jobs = list(
+                session.scalars(
+                    select(WebhookDeliveryJob).where(WebhookDeliveryJob.event_id == event_id)
+                ).all()
+            )
+            attempt_ids = list(
+                session.scalars(
+                    select(WebhookDeliveryAttempt.id).where(
+                        WebhookDeliveryAttempt.event_id == event_id
+                    )
+                ).all()
+            )
 
             assert stored_event is not None
             assert stored_event.id == event_id
@@ -103,10 +122,34 @@ def test_create_webhook_event() -> None:
             assert stored_event.created_at.tzinfo is not None
             assert stored_event.created_at.utcoffset() is not None
 
+            assert len(stored_jobs) == 1
+            stored_job = stored_jobs[0]
+            job_id = stored_job.id
+            assert isinstance(job_id, uuid.UUID)
+            assert stored_job.event_id == event_id
+            assert stored_job.status == "pending"
+            assert stored_job.next_attempt_at is not None
+            assert stored_job.next_attempt_at.tzinfo is not None
+            assert stored_job.next_attempt_at.utcoffset() is not None
+            assert stored_job.created_at.tzinfo is not None
+            assert stored_job.created_at.utcoffset() is not None
+            assert stored_job.updated_at.tzinfo is not None
+            assert stored_job.updated_at.utcoffset() is not None
+            assert stored_job.next_attempt_at.astimezone(UTC) == stored_event.created_at.astimezone(
+                UTC
+            )
+            assert attempt_ids == []
+
             assert stored_endpoint is not None
             assert stored_endpoint.is_active is False
     finally:
         with SessionFactory() as session:
+            if job_id is not None:
+                stored_job = session.get(WebhookDeliveryJob, job_id)
+                if stored_job is not None:
+                    session.delete(stored_job)
+            session.commit()
+
             if event_id is not None:
                 stored_event = session.get(WebhookEvent, event_id)
                 if stored_event is not None:
@@ -122,6 +165,8 @@ def test_create_webhook_event() -> None:
     assert event_id is not None
     assert endpoint_id is not None
     with SessionFactory() as session:
+        if job_id is not None:
+            assert session.get(WebhookDeliveryJob, job_id) is None
         assert session.get(WebhookEvent, event_id) is None
         assert session.get(WebhookEndpoint, endpoint_id) is None
 
@@ -253,6 +298,7 @@ def test_reject_invalid_webhook_event_request(
 ) -> None:
     with SessionFactory() as session:
         event_ids_before = set(session.scalars(select(WebhookEvent.id)).all())
+        job_ids_before = set(session.scalars(select(WebhookDeliveryJob.id)).all())
 
     with TestClient(app) as client:
         response = client.post("/webhook-events", json=request_body)
@@ -267,8 +313,10 @@ def test_reject_invalid_webhook_event_request(
 
     with SessionFactory() as session:
         event_ids_after = set(session.scalars(select(WebhookEvent.id)).all())
+        job_ids_after = set(session.scalars(select(WebhookDeliveryJob.id)).all())
 
     assert event_ids_after == event_ids_before
+    assert job_ids_after == job_ids_before
 
 
 def test_reject_webhook_event_for_missing_endpoint() -> None:
@@ -284,6 +332,7 @@ def test_reject_webhook_event_for_missing_endpoint() -> None:
     with SessionFactory() as session:
         assert session.get(WebhookEndpoint, missing_endpoint_id) is None
         event_ids_before = set(session.scalars(select(WebhookEvent.id)).all())
+        job_ids_before = set(session.scalars(select(WebhookDeliveryJob.id)).all())
 
     with TestClient(app) as client:
         response = client.post(
@@ -300,7 +349,10 @@ def test_reject_webhook_event_for_missing_endpoint() -> None:
 
     with SessionFactory() as session:
         event_ids_after = set(session.scalars(select(WebhookEvent.id)).all())
+        job_ids_after = set(session.scalars(select(WebhookDeliveryJob.id)).all())
 
         assert event_ids_after == event_ids_before
+        assert job_ids_after == job_ids_before
         assert session.get(WebhookEndpoint, missing_endpoint_id) is None
         assert set(session.scalars(select(WebhookEvent.id)).all()) == event_ids_after
+        assert set(session.scalars(select(WebhookDeliveryJob.id)).all()) == job_ids_after
