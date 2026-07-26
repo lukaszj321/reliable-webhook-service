@@ -11,6 +11,7 @@ service and returns one persisted `WebhookDeliveryAttempt`.
 - [HTTP request behavior](#http-request-behavior)
 - [Result classification](#result-classification)
 - [Attempt persistence](#attempt-persistence)
+- [Transaction ownership](#transaction-ownership)
 - [Attempt numbering](#attempt-numbering)
 - [Retry decision policy](#retry-decision-policy)
 - [Delivery job claiming](#delivery-job-claiming)
@@ -24,10 +25,15 @@ service and returns one persisted `WebhookDeliveryAttempt`.
 Delivery execution is synchronous. One service call performs at most one HTTP request, and every
 request that is actually executed ends with an attempt to persist one completed delivery attempt.
 The public manual POST route calls that service with a database session, HTTP client, and configured
-timeout. The service does not retry requests, and creating a webhook event does not trigger delivery
-automatically. Event creation atomically persists one `WebhookEvent` and one immediately due
-`pending` `WebhookDeliveryJob`, but it does not call `execute_webhook_delivery`, perform HTTP, or
-create a `WebhookDeliveryAttempt`.
+timeout. The execution service adds and flushes the completed attempt in the caller-owned
+transaction, and the manual route commits it. The service does not retry requests, and creating a
+webhook event does not trigger delivery automatically. Event creation atomically persists one
+`WebhookEvent` and one immediately due `pending` `WebhookDeliveryJob`, but it does not call
+`execute_webhook_delivery`, perform HTTP, or create a `WebhookDeliveryAttempt`.
+
+The external endpoint can receive the request before the attempt is committed, so HTTP execution
+and the database commit are not one atomic operation and this design does not provide exactly-once
+delivery.
 
 ## Preparation and validation
 
@@ -83,9 +89,40 @@ The service persists these fields:
 `target_url` is a snapshot of the URL used for the request. `duration_ms` uses a monotonic
 measurement and cannot be negative. `attempted_at` must be timezone-aware.
 
-After committing and refreshing the attempt, the service returns the persisted ORM object. A
-commit or refresh error causes a rollback and re-raises the exception. Persistence does not solve
-concurrent execution for the same event.
+Persistence within the execution service follows this sequence:
+
+1. create one completed `WebhookDeliveryAttempt`;
+2. call `session.add(attempt)`;
+3. call `session.flush()`;
+4. make the generated ID available and check database constraints that can be enforced during the
+   flush;
+5. return the ORM object;
+6. leave the caller-owned transaction open.
+
+The uncommitted attempt is available in the caller's transaction but is not visible to an
+independent PostgreSQL session. A caller rollback removes the attempt, while a caller commit makes
+it visible to other sessions. An event and endpoint committed before delivery remain after a
+rollback of the attempt transaction. A flush does not guarantee a commit.
+
+## Transaction ownership
+
+`execute_webhook_delivery` receives the caller's session. After completing the HTTP request and
+classifying its result, the execution service performs `add`, `flush`, and `return`. It does not
+commit, roll back, refresh, close the session, or create another session.
+
+The public manual route calls the execution service, performs exactly one `commit` after receiving
+the attempt, refreshes that attempt after the commit, and returns the response. The route does not
+perform its own rollback.
+
+A flush error propagates to the caller before commit. A commit error also propagates and prevents
+refresh. A refresh error propagates after the commit has succeeded; no rollback can undo that
+completed commit. Management of a failed or unfinished transaction remains with the caller and the
+existing session dependency.
+
+This boundary allows a future worker to prepare a completed delivery attempt and a delivery job
+transition in one caller-owned transaction after HTTP execution. That attempt-plus-job completion
+does not exist yet: this issue does not update `WebhookDeliveryJob` or connect delivery execution
+to the delivery job lifecycle.
 
 ## Attempt numbering
 
@@ -172,7 +209,12 @@ perform a completion transition.
   `failed` attempt.
 - An invalid timeout is not caught and does not create an attempt.
 - An invalid naive attempt timestamp prevents the request and does not create an attempt.
-- A database commit or refresh error rolls back the transaction and re-raises the exception.
+- A flush error propagates from the execution service before commit.
+- A route commit error propagates, and refresh is not performed.
+- A route refresh error propagates after a successful commit.
+- The execution service and manual route do not translate database errors into the documented
+  domain `HTTPException` responses.
+- The manual route does not perform rollback.
 
 ## Invocation
 
@@ -184,9 +226,10 @@ POST /webhook-events/{event_id}/delivery-attempts
 ```
 
 The route accepts a UUID path parameter and no request body. It synchronously performs exactly one
-outgoing request, using the timeout from `Settings`, and returns HTTP 201 with the persisted attempt.
-Both `succeeded` and expected `failed` delivery outcomes return HTTP 201 because the attempt was
-successfully completed and stored. Non-2xx responses, timeouts, and other transport errors are
+outgoing request through the execution service, using the timeout from `Settings`. The execution
+service adds and flushes the returned attempt; the manual route commits it, refreshes it, and
+returns HTTP 201. Both `succeeded` and expected `failed` delivery outcomes return HTTP 201 because
+the completed attempt was committed. Non-2xx responses, timeouts, and other transport errors are
 delivery results rather than API errors.
 
 Preparation errors occur before an outgoing request and do not create an attempt:
@@ -210,6 +253,12 @@ not call the delivery service or invoke the manual delivery endpoint automatical
 - Claiming does not execute HTTP or perform a completion transition
 - Retry policy and backoff calculation exist, but they are not connected to claiming and no
   automatic retry execution invokes them
+- No attempt-plus-job completion transaction
+- No delivery job success transition after a succeeded attempt
+- No retry rescheduling or dead-letter transition performed by a worker
+- No automatic retry policy invocation
+- No exactly-once delivery; caller-owned transaction alone cannot prevent resending after a crash
+  between the external HTTP request and the database commit
 - No stale `processing` recovery, lease, or heartbeat
 - No background worker
 - No replay

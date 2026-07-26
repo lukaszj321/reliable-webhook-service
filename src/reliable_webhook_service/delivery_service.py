@@ -140,12 +140,5 @@ def execute_webhook_delivery(
         attempted_at=attempted_at,
     )
     session.add(attempt)
-
-    try:
-        session.commit()
-        session.refresh(attempt)
-    except Exception:
-        session.rollback()
-        raise
-
+    session.flush()
     return attempt
