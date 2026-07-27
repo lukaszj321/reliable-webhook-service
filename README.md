@@ -78,6 +78,16 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Pure, deterministic retry policy with no jitter that returns `pending`, `succeeded`, or
   `dead_letter` decisions and normalizes timezone-aware `next_attempt_at` values to UTC
 - The retry policy is connected to internal job completion but is not invoked automatically
+- Internal, synchronous `run_webhook_delivery_processing_cycle` orchestration for one explicitly
+  invoked bounded batch
+- One dedicated claim transaction is committed and closed before HTTP; claimed job IDs are then
+  processed in deterministic order with one fresh completion transaction per job
+- Each successful per-job completion is committed before the next job starts, while a failed
+  current completion is rolled back and stops the cycle
+- Immutable cycle results contain claimed job IDs and primitive completion summaries without ORM
+  objects
+- Partial progress is intentional: earlier completion commits remain durable after a later
+  failure, so the cycle has no batch-level atomicity or batch rollback
 - HTTP 404 for a missing event and HTTP 409 for a missing or inactive endpoint before execution
 - Manual-only execution: creating a webhook event does not trigger delivery automatically
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
@@ -85,16 +95,15 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   event, and does not create or modify attempts
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
-- No worker, polling loop, automatic claim invocation, automatic completion invocation, automatic
-  retry execution, stale `processing` recovery, or public delivery-job API exists
+- No worker, polling loop, automatic cycle invocation, automatic retry execution, stale
+  `processing` recovery, or public delivery-job API exists
 
 ## Planned scope
 
 The following capabilities are planned but are not currently implemented:
 
-- Worker or background delivery processing
-- Automatic claim invocation
-- Automatic completion invocation for claimed jobs
+- Long-running worker and polling loop
+- Automatic bounded-cycle invocation
 - Automatic execution of retries already scheduled as `pending`
 - Stale `processing` recovery
 - Idempotency
@@ -141,25 +150,31 @@ flowchart LR
     Prepare -->|"reads event and active endpoint"| DeliveryData["Stored delivery data"]
     DeliveryData --> PostgreSQL
     Execute --> HTTPClient["WebhookHttpClient"]
-    HTTPClient -->|"exactly one HTTP POST"| Target["Endpoint target URL"]
+    HTTPClient -->|"exactly one external HTTP POST<br/>not rolled back by PostgreSQL"| Target["Endpoint target URL"]
     Target --> Classification["Classify delivery result"]
     Classification -->|"creates one completed attempt"| Attempt
     DeliverySession -->|"attempt add + flush through Execute"| Attempt
     AttemptPOST -->|"refresh after commit"| Attempt
-    InternalCaller["Internal application caller<br/>(not a worker loop)"]
-    InternalCaller -->|"owns transaction; commit or rollback"| CompletionSession["Completion SQLAlchemy session"]
-    InternalCaller -->|"invokes for committed processing job"| JobExecution["execute_webhook_delivery_job"]
-    JobExecution -->|"uses session; applies job update"| CompletionSession
-    CompletionSession -->|"loads processing job; flushes transition"| Job
+    ExplicitCaller["Explicit internal caller<br/>no worker loop or automatic invocation"]
+    ExplicitCaller -->|"one bounded invocation"| Cycle["run_webhook_delivery_processing_cycle"]
+    Cycle -->|"opens one dedicated session"| ClaimSession["Claim SQLAlchemy session"]
+    Cycle -->|"calls exactly once"| ClaimService["claim_due_webhook_delivery_jobs"]
+    ClaimService -->|"SELECT FOR UPDATE SKIP LOCKED<br/>pending to processing + flush"| ClaimSession
+    ClaimSession --> Job
+    ClaimService -->|"deterministic ordered rows"| IDSnapshot["Snapshot claimed job UUIDs"]
+    IDSnapshot --> ClaimEnd["Claim commit + close<br/>before completion and HTTP"]
+    ClaimSession --> ClaimEnd
+    ClaimEnd -->|"bounded ID order"| JobLoop["Iterate claimed job IDs<br/>stop on first failure"]
+    JobLoop -->|"fresh session per job"| CompletionSession["Per-job completion SQLAlchemy session"]
+    CompletionSession --> JobExecution["execute_webhook_delivery_job"]
     JobExecution -->|"calls exactly once"| Execute
-    CompletionSession -->|"attempt add + flush through Execute"| Attempt
+    CompletionSession -->|"attempt add + job transition flush"| Attempt
+    CompletionSession --> Job
     JobExecution -->|"completed outcome + attempt number"| RetryPolicy["decide_webhook_retry"]
     RetryPolicy -->|"status + next_attempt_at"| JobExecution
-    ClaimCaller["Internal claim caller<br/>(no automatic invocation)"]
-    ClaimCaller -->|"owns claim transaction; commits before HTTP"| ClaimSession["Claim SQLAlchemy session"]
-    ClaimCaller --> ClaimService["claim_due_webhook_delivery_jobs"]
-    ClaimService -->|"uses caller session"| ClaimSession
-    ClaimSession -->|"SELECT FOR UPDATE SKIP LOCKED<br/>pending to processing + flush"| Job
+    CompletionSession -->|"commit or rollback current job"| CompletionEnd["Close current completion session"]
+    CompletionEnd --> Result["Immutable claimed IDs<br/>and completed summaries"]
+    Cycle --> Limits["No batch transaction<br/>no exactly-once guarantee"]
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -170,20 +185,45 @@ flowchart LR
 performs one external HTTP request and flushes one completed attempt. The route commits and
 refreshes the attempt. It does not update the delivery job.
 
-**Internal completion transaction.** An internal caller passes a previously committed
-`processing` job to `execute_webhook_delivery_job`. The service calls `execute_webhook_delivery`
-once, receives one retry decision, updates the job, and flushes the transition. Caller commit makes
-the attempt and transition visible together; caller rollback removes the attempt and restores the
-previously committed `processing` job. The endpoint and event remain.
+**Bounded-cycle claim transaction.** An explicit internal caller invokes
+`run_webhook_delivery_processing_cycle` once. The cycle creates one claim session, calls
+`claim_due_webhook_delivery_jobs` exactly once for at most `limit` due jobs, snapshots their UUIDs,
+commits the `pending` to `processing` changes, and closes the claim session before completion or
+HTTP begins.
 
-**Claim transaction.** A separate caller can claim due `pending` jobs with `SELECT FOR UPDATE SKIP
-LOCKED`, flush `pending` to `processing`, and commit before any external HTTP request. No automatic
-orchestrator connects claim and completion, and no worker or polling loop exists.
+**Bounded-cycle per-job completion transactions.** The cycle processes the UUID snapshot in
+deterministic claim order. For each ID it creates a fresh session, calls
+`execute_webhook_delivery_job` once, performs one attempt, applies one retry decision, and commits
+the attempt plus job transition before closing the session and moving to the next ID. A current
+failure is rolled back, its session is closed, and later claimed jobs are not started.
+
+The complete bounded sequence is:
+
+1. create the claim session;
+2. claim at most `limit` due `pending` jobs;
+3. commit and close the claim transaction;
+4. retain only the ordered job IDs;
+5. create a fresh completion session for the next ID;
+6. perform one attempt;
+7. apply the retry policy;
+8. commit or roll back the current completion;
+9. close the current session;
+10. continue only after a successful completion commit.
+
+The cycle returns immutable snapshots of claimed IDs and completed job values rather than ORM
+objects. If job A commits and job B later fails, A remains completed, B's current completion is
+rolled back, and B plus any later claimed jobs remain `processing` because the claim transaction
+was already committed. There is no batch-level atomicity, batch rollback, or automatic recovery
+for these stale `processing` jobs.
 
 The external HTTP request is not part of the PostgreSQL transaction. A rollback cannot undo an
 HTTP request that already reached the target, so exactly-once delivery is not guaranteed. Detailed
 behavior is documented in [Database and migrations](docs/database.md), [Webhook delivery
 execution](docs/delivery-execution.md), and [API documentation](docs/api/index.md).
+
+The bounded cycle is an internal service and runs only when called explicitly. It is not a worker,
+background task, polling loop, scheduler, or automatic retry executor, and it does not invoke
+another cycle by itself.
 
 ## Technology stack
 
@@ -257,7 +297,7 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
 | [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, and `SKIP LOCKED` transaction semantics |
-| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, internal processing-job completion, retry decisions, claim and completion transaction boundaries, and limitations |
+| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, the explicit bounded processing cycle, per-job completion, partial progress, retry decisions, transaction boundaries, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |

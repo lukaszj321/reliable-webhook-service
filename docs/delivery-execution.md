@@ -1,15 +1,17 @@
 # Webhook Delivery Execution
 
-Delivery execution has three related entry points. `execute_webhook_delivery` performs one HTTP
+Delivery execution has four related entry points. `execute_webhook_delivery` performs one HTTP
 attempt and flushes one completed `WebhookDeliveryAttempt` in a caller-owned transaction. The
 internal `execute_webhook_delivery_job` service accepts a previously committed `processing` job,
 uses that execution service, applies one retry decision, and flushes the job transition in the same
-caller-owned transaction. The public manual endpoint uses only `execute_webhook_delivery`, commits
-the attempt, and does not update a delivery job.
+caller-owned transaction. `run_webhook_delivery_processing_cycle` explicitly connects claim and
+completion for one bounded batch. The public manual endpoint uses only
+`execute_webhook_delivery`, commits the attempt, and does not update a delivery job.
 
 ## Contents
 
 - [Current execution model](#current-execution-model)
+- [Bounded delivery processing cycle](#bounded-delivery-processing-cycle)
 - [Preparation and validation](#preparation-and-validation)
 - [HTTP request behavior](#http-request-behavior)
 - [Result classification](#result-classification)
@@ -38,12 +40,145 @@ not an endpoint, background service, or worker. Its caller supplies a previously
 attempt and transition share one caller-owned PostgreSQL transaction.
 
 The completion service does not select or claim work. Creating an event stores an immediately due
-`pending` job, and the separate claim service can change due jobs to `processing`, but no worker or
-polling loop connects event creation, claim, completion, or scheduled retry execution.
+`pending` job, and the separate claim service can change due jobs to `processing`. When explicitly
+invoked, the bounded processing cycle connects claim and completion for at most the requested
+limit. Event creation and the public API do not invoke that cycle, and no worker or polling loop
+runs it continuously or executes scheduled retries automatically.
 
 The target can receive the request before the completion transaction is committed. PostgreSQL can
 atomically commit or roll back the attempt and job transition, but it cannot roll back the external
 HTTP request and does not provide exactly-once delivery.
+
+## Bounded delivery processing cycle
+
+### Purpose
+
+`run_webhook_delivery_processing_cycle` is a synchronous, framework-independent orchestration
+service. One explicit internal invocation connects one call to
+`claim_due_webhook_delivery_jobs` with zero or more ordered calls to
+`execute_webhook_delivery_job`. One invocation performs one bounded batch and then returns; it is
+not a long-running worker or polling loop.
+
+The cycle does not import FastAPI or `Settings`, does not start automatically, and does not sleep
+or invoke another cycle. Application code must provide all dependencies and call it explicitly.
+
+### Inputs
+
+The caller supplies:
+
+- a session factory used to create the dedicated claim session and fresh completion sessions;
+- a `WebhookHttpClient`;
+- a timezone-aware `claimed_at`;
+- a batch `limit`;
+- the HTTP timeout;
+- maximum attempts and base and maximum retry delays;
+- explicit attempt, decision, and monotonic clocks when deterministic timing is required.
+
+### Validation
+
+Before opening the first session, the cycle validates:
+
+- `limit` is an integer greater than or equal to 1 and is not a Boolean;
+- `claimed_at` is timezone-aware;
+- the timeout is finite and greater than zero.
+
+Invalid input therefore creates no claim or completion session and performs no HTTP.
+
+### Claim phase
+
+The cycle:
+
+1. creates one dedicated claim session;
+2. calls `claim_due_webhook_delivery_jobs` exactly once with `claimed_at` and `limit`;
+3. receives jobs in deterministic `next_attempt_at`, `created_at`, and `id` order;
+4. snapshots their UUIDs before ending the claim session;
+5. commits the `pending` to `processing` changes;
+6. rolls back instead if claim execution or claim commit fails;
+7. always closes the claim session before completion and external HTTP begin.
+
+The snapshot separates later processing from claim-session ORM objects. The cycle never returns
+those objects.
+
+### Empty cycle
+
+When no due job is claimed, the cycle still commits and closes the claim transaction. It creates no
+completion session, performs no HTTP, and returns an immutable result with empty
+`claimed_job_ids` and `completed_jobs`.
+
+### Completion phase
+
+The cycle iterates over the snapshotted UUIDs in claim order. For each started job it:
+
+1. creates a fresh completion session;
+2. calls `execute_webhook_delivery_job` exactly once;
+3. lets that service perform one attempt and apply one retry decision in the same caller-owned
+   completion transaction;
+4. snapshots the resulting job ID, attempt ID, status, and `next_attempt_at`;
+5. commits the current attempt and job transition before starting another job;
+6. appends the primitive snapshot only after the commit succeeds;
+7. rolls back only the current completion transaction on execution or commit failure;
+8. always closes the current session.
+
+A failure is propagated immediately, so no later claimed UUID is started.
+
+### Result
+
+`WebhookDeliveryProcessingCycleResult` is an immutable snapshot containing:
+
+- `claimed_job_ids`: every UUID committed as `processing` by the claim transaction, in claim order;
+- `completed_jobs`: immutable primitive summaries for successfully committed completions, in the
+  same order;
+- `claimed_count`: the number of claimed UUIDs;
+- `completed_count`: the number of committed completion summaries.
+
+Each `WebhookDeliveryProcessingJobResult` contains `job_id`, `attempt_id`, `status`, and
+`next_attempt_at`. Neither result contains a SQLAlchemy session or ORM object.
+
+### Partial progress
+
+Consider three jobs claimed together:
+
+1. job A completes successfully and its completion transaction commits;
+2. job B raises an error and its current completion transaction rolls back;
+3. job C is not started because processing stops at B.
+
+Job A remains completed because its commit preceded B. Jobs B and C remain `processing` because
+the earlier claim transaction committed all three jobs before completion began. There is no shared
+batch transaction or batch rollback, and the cycle does not automatically restore either job to
+`pending`.
+
+The project has no stale-`processing` recovery. Operational code must not interpret a claimed but
+not completed job as automatically recoverable by the current implementation.
+
+### Failure boundaries
+
+| Failure | Transaction outcome | Session outcome | Further processing |
+|---|---|---|---|
+| Claim execution failure | Claim transaction rolls back | Claim session closes | No completion starts |
+| Claim commit failure | Claim transaction rolls back | Claim session closes | No completion starts |
+| Completion execution failure | Current completion rolls back | Current session closes | Later claimed jobs are not started |
+| Completion commit failure | Current completion rolls back | Current session closes | Later claimed jobs are not started |
+
+Previously committed per-job completions remain committed in every later completion-failure case.
+The cycle performs no batch-level compensating rollback.
+
+### HTTP limitation
+
+External HTTP is not part of the PostgreSQL transaction. An HTTP request can reach the target
+before the current completion transaction is rolled back, and PostgreSQL rollback cannot undo that
+external side effect. The bounded cycle therefore does not guarantee exactly-once delivery.
+
+### Still not implemented
+
+- long-running worker loop;
+- polling or sleep;
+- scheduler or automatic application-startup invocation;
+- continuous or parallel completion;
+- automatic execution of a scheduled `pending` retry;
+- stale-`processing` recovery, leases, or heartbeat;
+- exactly-once delivery;
+- idempotency;
+- replay.
 
 ## Preparation and validation
 
@@ -263,10 +398,12 @@ automatically.
 
 ## Delivery job claiming
 
-`claim_due_webhook_delivery_jobs` is a synchronous internal application service separate from
-completion. Claiming does not perform HTTP, and `execute_webhook_delivery_job` does not invoke the
-claim service. The retry policy remains pure decision logic even though completion applies its
-result to a job. No worker connects these components.
+`claim_due_webhook_delivery_jobs` is a synchronous internal application service with its own
+transaction responsibility. Claiming does not perform HTTP, and
+`execute_webhook_delivery_job` does not invoke the claim service. The explicitly invoked bounded
+processing cycle connects these services while preserving the separate claim and per-job
+completion transaction boundaries. The retry policy remains pure decision logic even though
+completion applies its result to a job.
 
 The normal `POST /webhook-events` path supplies the initial `pending` jobs. Their
 `next_attempt_at` represents the same instant as `event.created_at`, so they are immediately due
@@ -292,18 +429,19 @@ With concurrent claimers, session A can lock the first due job while session B s
 later unlocked due jobs. Real PostgreSQL integration tests verify that the two returned ID sets do
 not overlap. This is internal infrastructure, not a public endpoint.
 
-A future orchestrator would:
+The existing bounded processing cycle:
 
 1. claim due jobs in a claim transaction;
-2. commit that claim transaction;
-3. release its row locks;
-4. start a separate completion transaction for a selected `processing` job;
-5. call `execute_webhook_delivery_job` to perform HTTP and prepare the attempt plus transition;
-6. commit or roll back the completion transaction.
+2. snapshot the claimed UUIDs in deterministic order;
+3. commit that claim transaction;
+4. close the claim session and release its row locks;
+5. start a fresh completion transaction for each selected `processing` job;
+6. call `execute_webhook_delivery_job` to perform HTTP and prepare the attempt plus transition;
+7. commit or roll back the current completion transaction before another job starts.
 
 This sequence is not automatic. There is no worker loop, the claim service does not invoke
-completion, and completion does not invoke claim. The claim transaction therefore does not retain
-row locks during the external HTTP request.
+completion, and completion does not invoke claim; the bounded cycle must be called explicitly. The
+claim transaction therefore does not retain row locks during the external HTTP request.
 
 ## Error handling
 
@@ -366,11 +504,14 @@ caller supplies its `Session`, a `job_id`, HTTP client, timeout, retry settings,
 service does not import `Settings`; timeout and retry configuration are explicit caller
 arguments.
 
+Internal application code can also invoke `run_webhook_delivery_processing_cycle`. The caller
+supplies a session factory, HTTP client, claim time, bounded limit, timeout, retry settings, and
+clocks. One call performs one bounded cycle and returns; no public API route invokes it.
+
 ## Current limitations
 
 - No worker or polling loop
-- No automatic claim invocation
-- No automatic completion invocation
+- No automatic bounded-cycle invocation
 - No automatic execution of a scheduled `pending` retry
 - No stale `processing` recovery, lease, or heartbeat
 - No exactly-once delivery
