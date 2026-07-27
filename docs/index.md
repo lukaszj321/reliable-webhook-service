@@ -2,8 +2,9 @@
 
 This documentation covers local development, PostgreSQL persistence, atomic event and initial job
 creation, delivery job claiming, manual webhook execution, internal atomic attempt-plus-job
-completion, retry scheduling and terminal transitions, and the currently available HTTP API for
-Reliable Webhook Delivery Service.
+completion, the explicitly invoked bounded processing cycle, partial-progress semantics, retry
+scheduling and terminal transitions, and the currently available HTTP API for Reliable Webhook
+Delivery Service.
 
 ## Start here
 
@@ -21,9 +22,10 @@ Read the documentation in this order:
   migrations, atomic event and job transactions, the current schema, and delivery job claiming
   with `SKIP LOCKED`.
 - [Webhook delivery execution](delivery-execution.md) — manual execution,
-  `execute_webhook_delivery_job`, caller-owned completion transactions, `succeeded`, `pending`, and
-  `dead_letter` transitions, separate claim and completion transactions, and the absence of a
-  worker.
+  `execute_webhook_delivery_job`, the
+  [bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle), separate
+  claim and per-job completion transactions, partial progress, `succeeded`, `pending`, and
+  `dead_letter` transitions, and the absence of a long-running worker.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
@@ -51,6 +53,8 @@ Read the documentation in this order:
 - [Review transaction ownership](database.md#transaction-ownership)
 - [Review SKIP LOCKED concurrency semantics](database.md#postgresql-locking)
 - [Review delivery execution flow](delivery-execution.md#current-execution-model)
+- [Review the bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle)
+- [Review partial-progress semantics](delivery-execution.md#partial-progress)
 - [Review delivery transaction ownership](delivery-execution.md#transaction-ownership)
 - [Review atomic delivery job completion](delivery-execution.md#delivery-job-completion)
 - [Review claim and completion transaction boundaries](delivery-execution.md#delivery-job-claiming)
