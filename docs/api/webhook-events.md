@@ -172,8 +172,11 @@ persistence details.
   accepts a previously committed `processing` job, performs one completed delivery attempt,
   applies the retry policy, and flushes the attempt plus a `succeeded`, retryable `pending` with
   `next_attempt_at`, or `dead_letter` job transition in a caller-owned completion transaction.
-- No worker, polling loop, automatic claim invocation, automatic completion invocation, automatic
-  retry execution, stale `processing` recovery, exactly-once delivery, idempotency, or replay is
+- The internal bounded processing cycle and
+  [stale processing job recovery](../delivery-execution.md#stale-processing-job-recovery) exist,
+  but both require separate explicit internal invocation. This endpoint invokes neither service.
+- No worker, polling loop, automatic cycle invocation, automatic recovery invocation, or automatic
+  retry execution is implemented. Exactly-once delivery, idempotency, and replay are also not
   implemented.
 - No payload size limit is configured.
 - Authentication is not implemented.

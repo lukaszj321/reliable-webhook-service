@@ -232,10 +232,16 @@ An invalid UUID returns FastAPI HTTP 422 with its standard validation payload.
 - The POST endpoint is manual execution, not replay.
 - Retry policy and backoff calculation exist, but the manual endpoint does not invoke them.
 - A failed attempt does not reschedule its delivery job, and no automatic next attempt is executed.
-- Attempt-plus-job completion is not implemented as one transaction.
+- The manual POST endpoint commits only its manual delivery attempt transaction. It does not update
+  a delivery job or invoke retry policy, the bounded processing cycle, or stale processing job
+  recovery.
+- Internal `execute_webhook_delivery_job`, used by an explicitly invoked bounded processing cycle,
+  persists a completed attempt and its job transition in one caller-owned completion transaction.
+- [Stale processing job recovery](../delivery-execution.md#stale-processing-job-recovery) is also
+  internal and explicit; it creates no attempts. No API endpoint invokes processing or recovery.
 - Exactly-once delivery is not provided.
 - Replay is not implemented.
-- Background processing is not implemented.
+- Automatic retry execution and background processing are not implemented.
 - Pagination and filtering are not implemented for GET.
 - Authentication is not implemented.
 - A top-level `/webhook-delivery-attempts` endpoint does not exist.

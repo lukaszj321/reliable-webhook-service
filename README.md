@@ -88,6 +88,14 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   objects
 - Partial progress is intentional: earlier completion commits remain durable after a later
   failure, so the cycle has no batch-level atomicity or batch rollback
+- Internal, synchronous `recover_stale_webhook_delivery_jobs` service for one explicitly invoked
+  bounded recovery batch
+- Recovery selects `processing` jobs with `updated_at <= stale_before` in deterministic
+  `updated_at`, `created_at`, and `id` order through `FOR UPDATE SKIP LOCKED`
+- Recovery changes selected jobs from `processing` to `pending`, sets both `next_attempt_at` and
+  `updated_at` to the normalized `recovered_at`, and flushes without creating attempts or HTTP
+- The caller owns recovery commit or rollback, while the immutable result contains only recovered
+  job UUIDs
 - HTTP 404 for a missing event and HTTP 409 for a missing or inactive endpoint before execution
 - Manual-only execution: creating a webhook event does not trigger delivery automatically
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
@@ -95,8 +103,8 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   event, and does not create or modify attempts
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
-- No worker, polling loop, automatic cycle invocation, automatic retry execution, stale
-  `processing` recovery, or public delivery-job API exists
+- No worker, polling loop, automatic cycle invocation, automatic recovery invocation, automatic
+  retry execution, lease ownership, heartbeat, or public delivery-job API exists
 
 ## Planned scope
 
@@ -105,8 +113,11 @@ The following capabilities are planned but are not currently implemented:
 - Long-running worker and polling loop
 - Automatic bounded-cycle invocation
 - Automatic execution of retries already scheduled as `pending`
-- Stale `processing` recovery
+- Automatic stale `processing` recovery invocation and timeout configuration
+- Leases, lease ownership, and heartbeat
+- Remote delivery verification
 - Idempotency
+- Exactly-once delivery
 - Automatic delivery execution after event creation
 - Manual replay
 
@@ -175,6 +186,16 @@ flowchart LR
     CompletionSession -->|"commit or rollback current job"| CompletionEnd["Close current completion session"]
     CompletionEnd --> Result["Immutable claimed IDs<br/>and completed summaries"]
     Cycle --> Limits["No batch transaction<br/>no exactly-once guarantee"]
+    RecoveryCaller["Explicit internal recovery caller<br/>no automatic invocation"] -->|"one bounded recovery invocation"| RecoveryService["recover_stale_webhook_delivery_jobs"]
+    RecoveryCaller -->|"opens caller-owned transaction"| RecoverySession["Recovery SQLAlchemy session"]
+    RecoveryService -->|"processing + updated_at &lt;= stale_before<br/>ordered by updated_at, created_at, id<br/>limit + FOR UPDATE SKIP LOCKED"| RecoverySession
+    RecoverySession --> Job
+    RecoveryService -->|"processing to pending<br/>next_attempt_at = recovered_at<br/>updated_at = recovered_at"| RecoveryTransition["Recovered job state"]
+    RecoveryTransition --> Job
+    RecoverySession -->|"one flush; no internal commit"| RecoveryEnd["Caller commit or rollback<br/>then close"]
+    RecoveryService --> RecoveryIDs["Immutable recovered UUID snapshot"]
+    RecoveryService --> RecoveryNoIO["No HTTP and no attempt creation<br/>duplicate-delivery risk if earlier HTTP was uncertain"]
+    FutureCycleCaller["Separate future explicit caller"] -->|"later explicit invocation only"| Cycle
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -197,6 +218,14 @@ deterministic claim order. For each ID it creates a fresh session, calls
 the attempt plus job transition before closing the session and moving to the next ID. A current
 failure is rolled back, its session is closed, and later claimed jobs are not started.
 
+**Stale-job recovery transaction.** An explicit internal caller opens one session and transaction,
+then calls `recover_stale_webhook_delivery_jobs` with `stale_before`, `recovered_at`, and `limit`.
+The service selects one bounded batch of stale `processing` jobs through deterministic
+`FOR UPDATE SKIP LOCKED`, changes them to `pending`, sets `next_attempt_at` and `updated_at` to
+`recovered_at`, performs one flush, and returns an immutable UUID snapshot. It does not commit,
+roll back, or close the session. The caller commits the entire batch or rolls it back, then closes
+the session. Future delivery requires a separate explicit processing-cycle invocation.
+
 The complete bounded sequence is:
 
 1. create the claim session;
@@ -213,13 +242,17 @@ The complete bounded sequence is:
 The cycle returns immutable snapshots of claimed IDs and completed job values rather than ORM
 objects. If job A commits and job B later fails, A remains completed, B's current completion is
 rolled back, and B plus any later claimed jobs remain `processing` because the claim transaction
-was already committed. There is no batch-level atomicity, batch rollback, or automatic recovery
-for these stale `processing` jobs.
+was already committed. There is no batch-level atomicity or batch rollback. The explicit recovery
+service can later return sufficiently old `processing` jobs to `pending`, but nothing invokes it
+automatically.
 
 The external HTTP request is not part of the PostgreSQL transaction. A rollback cannot undo an
-HTTP request that already reached the target, so exactly-once delivery is not guaranteed. Detailed
-behavior is documented in [Database and migrations](docs/database.md), [Webhook delivery
-execution](docs/delivery-execution.md), and [API documentation](docs/api/index.md).
+HTTP request that already reached the target. If that request succeeded remotely but completion
+was not committed, recovery followed by a later explicit cycle can send the webhook again.
+Recovery performs no remote verification and creates no missing attempt, so idempotency and
+exactly-once delivery are not guaranteed. Detailed behavior is documented in [Database and
+migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
+documentation](docs/api/index.md).
 
 The bounded cycle is an internal service and runs only when called explicitly. It is not a worker,
 background task, polling loop, scheduler, or automatic retry executor, and it does not invoke
@@ -296,8 +329,8 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 |---|---|
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
-| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, and `SKIP LOCKED` transaction semantics |
-| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, the explicit bounded processing cycle, per-job completion, partial progress, retry decisions, transaction boundaries, and limitations |
+| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, recovery, and `SKIP LOCKED` transaction semantics |
+| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, the explicit bounded processing cycle, stale processing job recovery, per-job completion, duplicate-delivery risk, transaction boundaries, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
