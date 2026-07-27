@@ -11,6 +11,7 @@ PostgreSQL stores the application's persistent data, and Alembic manages the dat
 - [Database schema](#database-schema)
 - [Atomic event and delivery job creation](#atomic-event-and-delivery-job-creation)
 - [Delivery job claiming](#delivery-job-claiming)
+- [Stale processing job recovery](#stale-processing-job-recovery)
 - [Bounded delivery processing cycle](#bounded-delivery-processing-cycle)
 - [ORM behavior](#orm-behavior)
 - [Validation boundary](#validation-boundary)
@@ -153,8 +154,9 @@ transaction that can commit `succeeded`, retryable `pending` with `next_attempt_
 `dead_letter`.
 
 No worker, polling loop, or automatic cycle invocation exists. A scheduled `pending` retry only
-records eligibility for a future explicit or planned invocation. Stale `processing` recovery and
-replay are not implemented.
+records eligibility for a future explicit or planned invocation. Stale processing job recovery is
+available only through an explicit internal service; automatic recovery invocation and replay are
+not implemented.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -165,7 +167,7 @@ replay are not implemented.
 | `created_at` | `TIMESTAMP WITH TIME ZONE` | No | `now()` | Creation timestamp |
 | `updated_at` | `TIMESTAMP WITH TIME ZONE` | No | `now()` | Initial or stored update timestamp |
 
-#### Constraints and indexes
+#### Delivery job constraints and indexes
 
 - `id` is the primary key.
 - `event_id` is a foreign key to `webhook_events.id` and uses `ON DELETE CASCADE`.
@@ -195,7 +197,8 @@ implements `pending` to `processing`. The completion service implements `process
 one claim commit followed by one commit or rollback for each started job. Schema constraints
 continue to enforce the allowed statuses and the required nullability of `next_attempt_at`, but
 they do not provide this orchestration. The worker lifecycle remains unimplemented, and
-`next_attempt_at` is not polled or executed automatically.
+`next_attempt_at` is not polled or executed automatically. An explicit recovery service can return
+sufficiently old `processing` jobs to `pending`; database constraints do not invoke it.
 
 ### webhook_delivery_attempts
 
@@ -219,7 +222,7 @@ automatically.
 | `duration_ms` | `INTEGER` | No | None | Attempt duration in milliseconds |
 | `attempted_at` | `TIMESTAMP WITH TIME ZONE` | No | `now()` | Attempt timestamp |
 
-#### Constraints and indexes
+#### Delivery attempt constraints and indexes
 
 - `id` is the primary key.
 - `event_id` is a foreign key to `webhook_events.id` and does not use `ON DELETE CASCADE`.
@@ -319,7 +322,7 @@ The service performs this sequence:
 
 The two flushes send changes through the same transaction; they are not commits.
 
-### Transaction ownership
+### Atomic creation transaction ownership
 
 The service does not commit, roll back, or close the caller's session. After both flushes, the API
 route performs one commit. Before that commit, another session sees neither the event nor its job.
@@ -384,7 +387,7 @@ Each claimed job changes from `pending` to `processing`. Its `id`, `event_id`, `
 `claimed_at` normalized to UTC. Preserving the non-null `next_attempt_at` keeps the claimed
 `processing` row consistent with the existing database constraint.
 
-### Transaction ownership
+### Claim transaction ownership
 
 The caller owns the transaction. The service executes `SELECT FOR UPDATE SKIP LOCKED`, changes the
 selected ORM objects, and flushes those changes, but it does not commit, roll back, or close the
@@ -404,9 +407,48 @@ not remain open during HTTP. No worker or polling loop invokes this lifecycle au
 - Newly created pending jobs are not claimed or consumed automatically.
 - The standalone claim service does not execute HTTP or complete a job.
 - A retryable `pending` schedule is not executed without a future explicit or planned invocation.
-- No stale `processing` recovery exists.
-- No lease, heartbeat, or lock-timeout lifecycle exists.
+- Stale `processing` recovery requires an explicit internal invocation.
+- No automatic recovery invocation, lease timestamp, lease owner, heartbeat, or configured stale
+  timeout exists.
 - No public delivery job API exists.
+
+## Stale processing job recovery
+
+A bounded processing cycle can leave jobs as `processing` after its claim transaction commits but
+before every per-job completion commits. A process failure in that interval has the same effect.
+The internal synchronous `recover_stale_webhook_delivery_jobs` service provides one explicit
+bounded recovery batch; no worker, poller, scheduler, startup hook, or database constraint invokes
+it automatically.
+
+Recovery eligibility is exact and inclusive:
+
+- `status` is `processing`;
+- `updated_at <= stale_before`.
+
+`updated_at` is currently the only persisted marker for the age of `processing`. There is no lease
+timestamp, lease owner, or heartbeat. Both `stale_before` and `recovered_at` must be timezone-aware,
+are normalized to UTC, and must satisfy `recovered_at >= stale_before`.
+
+The service performs one query ordered by `updated_at`, then `created_at`, then `id`. The caller's
+`limit` bounds the batch, and PostgreSQL selects rows through `FOR UPDATE SKIP LOCKED`. Concurrent
+sessions can therefore recover disjoint batches, while a row already locked by another transaction
+is skipped without waiting for that lock.
+
+Each selected job changes from `processing` to `pending`. Both `next_attempt_at` and `updated_at`
+are set to the normalized `recovered_at`. After all mutations the service performs one flush and
+returns an immutable snapshot of recovered UUIDs. It creates no `WebhookDeliveryAttempt`, performs
+no HTTP, and makes no retry-policy decision.
+
+The caller owns the entire recovery transaction. A caller commit persists the whole bounded batch;
+a caller rollback restores the previously committed `processing` state. Row locks remain held
+until that commit or rollback, and the caller then closes the session. The service itself does not
+commit, roll back, or close.
+
+Recovery only makes a job eligible for later work. A separate explicit processing-cycle invocation
+is required to deliver it. PostgreSQL cannot determine whether an earlier HTTP request reached the
+remote target. If it did but completion was not committed, later processing of the recovered job
+can cause duplicate delivery. Recovery performs no remote verification and does not provide
+idempotency or exactly-once delivery.
 
 ## Bounded delivery processing cycle
 
@@ -438,7 +480,8 @@ One cycle is not a shared batch transaction. If jobs A, B, and C were claimed to
 complete and commit before B starts. If B then fails, only B's current completion transaction is
 rolled back and the cycle stops; A remains committed and C is not started. B and C remain
 `processing` because the earlier claim transaction committed all three transitions. There is no
-batch rollback and no automatic stale-`processing` recovery.
+batch rollback. The explicit stale processing job recovery service can later return eligible jobs
+to `pending`, but nothing invokes recovery automatically.
 
 A claim execution or claim-commit failure rolls back and closes the claim session without starting
 completion. A completion execution or completion-commit failure rolls back and closes only the
@@ -491,6 +534,9 @@ through SQLAlchemy's ORM configuration.
   automatically after changes.
 - The internal claim service explicitly sets `updated_at` to its normalized `claimed_at` and
   preserves `next_attempt_at`.
+- The internal recovery service uses `updated_at` as its persisted age marker, sets selected stale
+  `processing` jobs to `pending`, and assigns its normalized `recovered_at` to both
+  `next_attempt_at` and `updated_at`.
 - The claim service uses the caller's session and flushes the `pending` to `processing` transition,
   but it does not commit, roll back, or close the session.
 - The bounded processing cycle explicitly connects claim and completion: it commits and closes one
@@ -501,6 +547,7 @@ through SQLAlchemy's ORM configuration.
 - Deleting an event removes its job through database `ON DELETE CASCADE`.
 - `SessionFactory` continues to use `expire_on_commit=False`.
 - No public job API, automatic cycle invocation, polling loop, or worker currently exists.
+- No automatic recovery invocation, lease ownership, or heartbeat currently exists.
 
 **WebhookDeliveryAttempt**
 
@@ -550,7 +597,7 @@ the `pending` to `processing` transition. Row locking is query behavior, not a s
 The database does not enforce a complete state machine. The event creation service prepares one
 initial job for the API path, while the database only enforces that an event cannot have more than
 one job. The bounded cycle provides application-level orchestration and transaction ownership; the
-schema does not invoke it or recover stale `processing` jobs.
+schema invokes neither the cycle nor the separate stale processing job recovery service.
 
 ## Navigation
 

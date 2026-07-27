@@ -1,22 +1,25 @@
 # Webhook Delivery Execution
 
-Delivery execution has four related entry points. `execute_webhook_delivery` performs one HTTP
+Delivery execution and recovery have five related entry points. `execute_webhook_delivery` performs one HTTP
 attempt and flushes one completed `WebhookDeliveryAttempt` in a caller-owned transaction. The
 internal `execute_webhook_delivery_job` service accepts a previously committed `processing` job,
 uses that execution service, applies one retry decision, and flushes the job transition in the same
 caller-owned transaction. `run_webhook_delivery_processing_cycle` explicitly connects claim and
-completion for one bounded batch. The public manual endpoint uses only
-`execute_webhook_delivery`, commits the attempt, and does not update a delivery job.
+completion for one bounded batch. `recover_stale_webhook_delivery_jobs` explicitly returns one
+bounded batch of stale `processing` jobs to `pending` without HTTP or attempt creation. The public
+manual endpoint uses only `execute_webhook_delivery`, commits the attempt, and does not update a
+delivery job.
 
 ## Contents
 
 - [Current execution model](#current-execution-model)
 - [Bounded delivery processing cycle](#bounded-delivery-processing-cycle)
+- [Stale processing job recovery](#stale-processing-job-recovery)
 - [Preparation and validation](#preparation-and-validation)
 - [HTTP request behavior](#http-request-behavior)
 - [Result classification](#result-classification)
 - [Attempt persistence](#attempt-persistence)
-- [Transaction ownership](#transaction-ownership)
+- [Delivery transaction ownership](#delivery-transaction-ownership)
 - [Attempt numbering](#attempt-numbering)
 - [Retry decision policy](#retry-decision-policy)
 - [Delivery job completion](#delivery-job-completion)
@@ -147,8 +150,9 @@ the earlier claim transaction committed all three jobs before completion began. 
 batch transaction or batch rollback, and the cycle does not automatically restore either job to
 `pending`.
 
-The project has no stale-`processing` recovery. Operational code must not interpret a claimed but
-not completed job as automatically recoverable by the current implementation.
+The explicit stale processing job recovery service can later restore eligible claimed but not
+completed jobs to `pending`. The bounded cycle does not invoke recovery, and no automatic recovery
+mechanism exists.
 
 ### Failure boundaries
 
@@ -175,9 +179,131 @@ external side effect. The bounded cycle therefore does not guarantee exactly-onc
 - scheduler or automatic application-startup invocation;
 - continuous or parallel completion;
 - automatic execution of a scheduled `pending` retry;
-- stale-`processing` recovery, leases, or heartbeat;
+- automatic stale processing job recovery invocation;
+- leases, lease owners, or heartbeat;
 - exactly-once delivery;
 - idempotency;
+- replay.
+
+## Stale processing job recovery
+
+### Cycle purpose
+
+A job can remain `processing` when its claim transaction commits but the process stops before its
+per-job completion commits. A later completion failure can also leave later jobs from the same
+claimed batch unstarted in `processing`.
+
+`recover_stale_webhook_delivery_jobs` is a synchronous, framework-independent service for one
+explicit bounded recovery batch. It does not run automatically and is not a worker, polling loop,
+scheduler, background task, or application startup hook.
+
+### Cycle inputs
+
+The caller supplies:
+
+- a caller-owned SQLAlchemy `Session`;
+- `stale_before`, the recovery cutoff;
+- `recovered_at`, the timestamp assigned to recovered state;
+- `limit`, the maximum number of jobs in this bounded recovery batch.
+
+### Cycle validation
+
+Before executing SQL, the service requires:
+
+- a positive integer `limit` that is not a Boolean;
+- a timezone-aware `stale_before`;
+- a timezone-aware `recovered_at`;
+- `recovered_at >= stale_before` after both timestamps are normalized to UTC.
+
+Invalid input raises `ValueError` before a query or flush.
+
+### Eligibility
+
+A job is eligible only when:
+
+- `status` is `processing`;
+- `updated_at <= stale_before`.
+
+The cutoff is inclusive. Fresh `processing` jobs and every `pending`, `succeeded`, or
+`dead_letter` job are skipped. `updated_at` is currently the persisted age marker; there is no
+lease timestamp or heartbeat.
+
+### Selection and locking
+
+One invocation executes one query in deterministic recovery order:
+
+1. `updated_at`;
+2. `created_at`;
+3. `id`.
+
+The caller's `limit` bounds the result. PostgreSQL uses `SELECT FOR UPDATE SKIP LOCKED`, so
+concurrent recovery sessions can select disjoint batches. A row locked by another transaction is
+skipped without waiting for that row; locks acquired by recovery remain active until its
+caller-owned transaction ends.
+
+### State transition
+
+For every selected job the service:
+
+1. changes `processing` to `pending`;
+2. sets `next_attempt_at = recovered_at`;
+3. sets `updated_at = recovered_at`;
+4. performs one flush after all mutations.
+
+Both assigned timestamps use normalized UTC. Recovery creates no `WebhookDeliveryAttempt`,
+performs no HTTP, and does not invoke the retry policy or processing cycle.
+
+### Transaction ownership
+
+The entire bounded recovery batch is one caller-owned transaction. The service does not commit,
+roll back, or close the session:
+
+- caller commit persists every transition in the selected batch;
+- caller rollback restores the previously committed `processing` state;
+- row locks remain active until caller commit or rollback;
+- selection and flush failures propagate to the caller, which owns rollback and close.
+
+### Empty recovery
+
+When no job is eligible, the service returns an empty immutable result. It performs no flush,
+mutation, commit, rollback, or close.
+
+### Cycle result
+
+`WebhookDeliveryJobRecoveryResult` contains:
+
+- `recovered_job_ids`, an ordered `tuple[UUID, ...]`;
+- `recovered_count`, a read-only property derived from that tuple.
+
+The result is an immutable UUID snapshot and contains no ORM object or session.
+
+### Duplicate-delivery limitation
+
+A concrete failure sequence is:
+
+1. a job is claimed as `processing`;
+2. its HTTP request reaches the endpoint;
+3. the process stops before the completion transaction commits;
+4. the job remains `processing` without a committed completion;
+5. explicit recovery returns it to `pending`;
+6. a later, separately invoked processing cycle sends the webhook again.
+
+PostgreSQL does not know whether the remote target received the earlier request, and rollback
+cannot undo HTTP. Recovery performs no remote verification, creates no missing attempt, and
+performs no compensating action. The project has no idempotency key and provides no exactly-once
+guarantee.
+
+### Cycle capabilities still not implemented
+
+- automatic recovery invocation;
+- worker loop, polling, or sleep;
+- scheduler or application startup hook;
+- leases, lease owners, or heartbeat;
+- stale timeout configuration in `Settings`;
+- remote delivery verification;
+- automatic retry execution;
+- idempotency;
+- exactly-once delivery;
 - replay.
 
 ## Preparation and validation
@@ -249,7 +375,7 @@ independent PostgreSQL session. A caller rollback removes the attempt, while a c
 it visible to other sessions. An event and endpoint committed before delivery remain after a
 rollback of the attempt transaction. A flush does not guarantee a commit.
 
-## Transaction ownership
+## Delivery transaction ownership
 
 ### `execute_webhook_delivery`
 
@@ -508,14 +634,20 @@ Internal application code can also invoke `run_webhook_delivery_processing_cycle
 supplies a session factory, HTTP client, claim time, bounded limit, timeout, retry settings, and
 clocks. One call performs one bounded cycle and returns; no public API route invokes it.
 
+Internal application code can separately invoke `recover_stale_webhook_delivery_jobs` with a
+caller-owned session, recovery cutoff, recovered timestamp, and limit. No API route, event
+creation path, manual delivery route, or processing cycle invokes recovery. A recovered `pending`
+job requires a later separate explicit processing-cycle invocation for delivery.
+
 ## Current limitations
 
 - No worker or polling loop
 - No automatic bounded-cycle invocation
+- No automatic stale processing job recovery invocation
 - No automatic execution of a scheduled `pending` retry
-- No stale `processing` recovery, lease, or heartbeat
+- No lease, lease owner, heartbeat, or configured stale timeout
 - No exactly-once delivery
-- A crash after external HTTP but before commit can cause a later resend
+- Recovery after a crash following external HTTP but before commit can cause duplicate delivery
 - No concurrent attempt-number allocation protection beyond the database unique constraint
 - No idempotency
 - No replay

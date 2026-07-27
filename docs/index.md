@@ -3,8 +3,9 @@
 This documentation covers local development, PostgreSQL persistence, atomic event and initial job
 creation, delivery job claiming, manual webhook execution, internal atomic attempt-plus-job
 completion, the explicitly invoked bounded processing cycle, partial-progress semantics, retry
-scheduling and terminal transitions, and the currently available HTTP API for Reliable Webhook
-Delivery Service.
+scheduling and terminal transitions, explicit stale processing job recovery, its
+duplicate-delivery limitation, and the currently available HTTP API for Reliable Webhook Delivery
+Service.
 
 ## Start here
 
@@ -20,12 +21,15 @@ Read the documentation in this order:
 - [Development setup](development.md) — install, configure, run, and validate the project locally.
 - [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
   migrations, atomic event and job transactions, the current schema, and delivery job claiming
-  with `SKIP LOCKED`.
+  and recovery transaction semantics with `SKIP LOCKED`.
 - [Webhook delivery execution](delivery-execution.md) — manual execution,
   `execute_webhook_delivery_job`, the
   [bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle), separate
   claim and per-job completion transactions, partial progress, `succeeded`, `pending`, and
-  `dead_letter` transitions, and the absence of a long-running worker.
+  `dead_letter` transitions, and
+  [stale processing job recovery](delivery-execution.md#stale-processing-job-recovery). Recovery
+  is an explicit internal service rather than an automatic mechanism; the guide also explains the
+  duplicate-delivery risk after an uncertain earlier HTTP result.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
@@ -50,12 +54,13 @@ Read the documentation in this order:
 - [Review the current database schema](database.md#database-schema)
 - [Review atomic event and delivery job creation](database.md#atomic-event-and-delivery-job-creation)
 - [Review delivery job claiming](database.md#delivery-job-claiming)
-- [Review transaction ownership](database.md#transaction-ownership)
+- [Review claim transaction ownership](database.md#claim-transaction-ownership)
 - [Review SKIP LOCKED concurrency semantics](database.md#postgresql-locking)
 - [Review delivery execution flow](delivery-execution.md#current-execution-model)
 - [Review the bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle)
+- [Review stale processing job recovery](delivery-execution.md#stale-processing-job-recovery)
 - [Review partial-progress semantics](delivery-execution.md#partial-progress)
-- [Review delivery transaction ownership](delivery-execution.md#transaction-ownership)
+- [Review delivery transaction ownership](delivery-execution.md#delivery-transaction-ownership)
 - [Review atomic delivery job completion](delivery-execution.md#delivery-job-completion)
 - [Review claim and completion transaction boundaries](delivery-execution.md#delivery-job-claiming)
 - [Review delivery result classification](delivery-execution.md#result-classification)
