@@ -166,9 +166,15 @@ persistence details.
   `POST /webhook-events/{event_id}/delivery-attempts`.
 - One synchronous delivery can be started explicitly through
   `POST /webhook-events/{event_id}/delivery-attempts`.
-- No worker or automatic claim invocation exists.
-- Automatic retry execution, completion transitions, retry rescheduling, stale `processing`
-  recovery, idempotency, and replay are not implemented.
+- `POST /webhook-events` does not perform HTTP, claim its job, call
+  `execute_webhook_delivery_job`, schedule a retry, or execute a retry automatically.
+- Outside this endpoint, the explicitly invoked internal `execute_webhook_delivery_job` service
+  accepts a previously committed `processing` job, performs one completed delivery attempt,
+  applies the retry policy, and flushes the attempt plus a `succeeded`, retryable `pending` with
+  `next_attempt_at`, or `dead_letter` job transition in a caller-owned completion transaction.
+- No worker, polling loop, automatic claim invocation, automatic completion invocation, automatic
+  retry execution, stale `processing` recovery, exactly-once delivery, idempotency, or replay is
+  implemented.
 - No payload size limit is configured.
 - Authentication is not implemented.
 
