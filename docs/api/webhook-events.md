@@ -154,9 +154,9 @@ Because `next_attempt_at` represents the same instant as `event.created_at`, the
 due. Nothing invokes `claim_due_webhook_delivery_jobs` automatically.
 
 Creating the job does not send the payload to `target_url`, create a delivery attempt, invoke the
-claim service, apply retry policy, start a worker, or move the job to `processing`. See [Database
-and migrations](../database.md#atomic-event-and-delivery-job-creation) for transaction and
-persistence details.
+claim service, apply retry policy, invoke the bounded worker iteration, or move the job to
+`processing`. See [Database and migrations](../database.md#atomic-event-and-delivery-job-creation)
+for transaction and persistence details.
 
 ## Non-goals and current limitations
 
@@ -172,11 +172,17 @@ persistence details.
   accepts a previously committed `processing` job, performs one completed delivery attempt,
   applies the retry policy, and flushes the attempt plus a `succeeded`, retryable `pending` with
   `next_attempt_at`, or `dead_letter` job transition in a caller-owned completion transaction.
-- The internal bounded processing cycle and
-  [stale processing job recovery](../delivery-execution.md#stale-processing-job-recovery) exist,
-  but both require separate explicit internal invocation. This endpoint invokes neither service.
-- No worker, polling loop, automatic cycle invocation, automatic recovery invocation, or automatic
-  retry execution is implemented. Exactly-once delivery, idempotency, and replay are also not
+- The standalone bounded processing cycle and
+  [stale processing job recovery](../delivery-execution.md#stale-processing-job-recovery) remain
+  available for separate explicit internal invocation.
+- The internal
+  [bounded worker iteration](../delivery-execution.md#bounded-worker-iteration) explicitly
+  orchestrates one recovery phase followed by one processing cycle.
+- This endpoint invokes neither standalone service nor the bounded worker iteration. All require
+  explicit internal invocation.
+- The bounded worker iteration is one-shot. No long-running worker process, worker loop, polling,
+  scheduler, application-startup hook, automatic retry execution, or automatic iteration
+  invocation is implemented. Exactly-once delivery, idempotency, and replay are also not
   implemented.
 - No payload size limit is configured.
 - Authentication is not implemented.

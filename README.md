@@ -30,7 +30,8 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - PostgreSQL JSONB event persistence linked to an existing `WebhookEndpoint`; inactive endpoints
   are accepted, while a missing endpoint returns HTTP 404 without creating either record
 - The event response still contains only the event; creating its durable job does not execute HTTP,
-  create a delivery attempt, invoke claiming or retry logic, or start a worker
+  create a delivery attempt, invoke claiming or retry logic, or invoke the bounded worker
+  iteration
 - `WebhookDeliveryJob` ORM model and `webhook_delivery_jobs` PostgreSQL table for durable processing
   state linked to `WebhookEvent`, with at most one job per event
 - Delivery job statuses: `pending`, `processing`, `succeeded`, and `dead_letter`
@@ -96,6 +97,18 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   `updated_at` to the normalized `recovered_at`, and flushes without creating attempts or HTTP
 - The caller owns recovery commit or rollback, while the immutable result contains only recovered
   job UUIDs
+- Internal, synchronous `run_webhook_worker_iteration` service for one explicitly invoked bounded
+  worker iteration: one stale-job recovery batch followed by exactly one bounded processing cycle
+- Worker-iteration validation finishes before a session is created; a dedicated recovery session
+  commits and closes before the processing phase creates its own sessions or performs HTTP
+- The same normalized `iteration_at` is passed as recovery `recovered_at` and processing
+  `claimed_at`, so a recovered job is eligible for the claim phase of the same iteration
+- Independent `recovery_limit` and `processing_limit` values bound the two phases separately
+- The immutable composed worker result embeds the lower-level recovery and processing results,
+  exposes their derived counts, and contains no ORM objects or mutable collections
+- Recovery and processing are separate transaction boundaries: a processing failure cannot undo
+  the durable recovery commit, earlier per-job completion commits remain durable, and there is no
+  iteration-wide transaction or batch rollback
 - HTTP 404 for a missing event and HTTP 409 for a missing or inactive endpoint before execution
 - Manual-only execution: creating a webhook event does not trigger delivery automatically
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
@@ -103,15 +116,19 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   event, and does not create or modify attempts
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
-- No worker, polling loop, automatic cycle invocation, automatic recovery invocation, automatic
-  retry execution, lease ownership, heartbeat, or public delivery-job API exists
+- The bounded worker iteration is a one-shot internal service invoked explicitly; no long-running
+  worker process, worker loop, polling, sleep, scheduler, CLI, startup hook, automatic invocation,
+  lease ownership, heartbeat, or public delivery-job API exists
 
 ## Planned scope
 
 The following capabilities are planned but are not currently implemented:
 
-- Long-running worker and polling loop
-- Automatic bounded-cycle invocation
+- Long-running worker process, worker loop, and polling
+- Worker sleep interval and graceful shutdown
+- Worker CLI, scheduler, and application startup hook
+- Environment-driven worker configuration
+- Automatic worker or bounded-cycle invocation
 - Automatic execution of retries already scheduled as `pending`
 - Automatic stale `processing` recovery invocation and timeout configuration
 - Leases, lease ownership, and heartbeat
@@ -166,7 +183,7 @@ flowchart LR
     Classification -->|"creates one completed attempt"| Attempt
     DeliverySession -->|"attempt add + flush through Execute"| Attempt
     AttemptPOST -->|"refresh after commit"| Attempt
-    ExplicitCaller["Explicit internal caller<br/>no worker loop or automatic invocation"]
+    ExplicitCaller["Explicit standalone cycle caller<br/>no automatic invocation"]
     ExplicitCaller -->|"one bounded invocation"| Cycle["run_webhook_delivery_processing_cycle"]
     Cycle -->|"opens one dedicated session"| ClaimSession["Claim SQLAlchemy session"]
     Cycle -->|"calls exactly once"| ClaimService["claim_due_webhook_delivery_jobs"]
@@ -196,6 +213,23 @@ flowchart LR
     RecoveryService --> RecoveryIDs["Immutable recovered UUID snapshot"]
     RecoveryService --> RecoveryNoIO["No HTTP and no attempt creation<br/>duplicate-delivery risk if earlier HTTP was uncertain"]
     FutureCycleCaller["Separate future explicit caller"] -->|"later explicit invocation only"| Cycle
+    WorkerCaller["Explicit internal worker-iteration caller<br/>one-shot; no automatic invocation"]
+    WorkerCaller --> WorkerValidation["Validate all orchestration inputs<br/>before session creation"]
+    WorkerValidation --> WorkerIteration["run_webhook_worker_iteration"]
+    WorkerValidation --> WorkerTime["Normalize iteration_at and stale_before to UTC<br/>require iteration_at >= stale_before"]
+    WorkerIteration --> WorkerLimits["Independent recovery_limit<br/>and processing_limit"]
+    WorkerIteration -->|"open dedicated recovery session"| RecoverySession
+    WorkerLimits -->|"recovery_limit"| RecoveryService
+    WorkerTime -->|"same iteration_at as recovered_at"| RecoveryService
+    RecoveryEnd -->|"commit then close before processing"| WorkerProcessing["Begin processing phase"]
+    WorkerTime -->|"same iteration_at as claimed_at"| WorkerProcessing
+    WorkerLimits -->|"processing_limit"| WorkerProcessing
+    WorkerProcessing -->|"invoke exactly once"| Cycle
+    RecoveryService -->|"failure: rollback and close"| WorkerRecoveryFailure["Stop iteration<br/>no processing or HTTP"]
+    RecoveryIDs --> WorkerResult["Immutable composed worker result<br/>recovery + processing; no ORM objects"]
+    Result --> WorkerResult
+    Cycle -->|"failure after durable recovery commit"| WorkerPartial["No recovery compensation<br/>earlier completion commits remain"]
+    WorkerPartial --> WorkerDuplicate["Partial progress<br/>possible duplicate remote delivery"]
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -224,9 +258,28 @@ The service selects one bounded batch of stale `processing` jobs through determi
 `FOR UPDATE SKIP LOCKED`, changes them to `pending`, sets `next_attempt_at` and `updated_at` to
 `recovered_at`, performs one flush, and returns an immutable UUID snapshot. It does not commit,
 roll back, or close the session. The caller commits the entire batch or rolls it back, then closes
-the session. Future delivery requires a separate explicit processing-cycle invocation.
+the session. A standalone recovery call requires a later explicit processing-cycle invocation;
+the bounded worker iteration can instead provide that recovery-before-processing sequence in one
+explicit orchestration call.
 
-The complete bounded sequence is:
+**Bounded worker-iteration orchestration.** An explicit internal caller invokes
+`run_webhook_worker_iteration` once. The service validates every orchestration argument before
+creating a session, normalizes `iteration_at` and `stale_before` to UTC, and requires
+`iteration_at >= stale_before`. It opens one dedicated recovery session, invokes one recovery batch
+with `recovery_limit`, commits or rolls back that transaction, and closes the session. Only after a
+successful recovery commit and close does it invoke exactly one bounded processing cycle with the
+independent `processing_limit`. The same normalized `iteration_at` is used as recovery
+`recovered_at` and processing `claimed_at`.
+
+The processing cycle owns its separate claim session and fresh per-job completion sessions. The
+recovery session and its row locks therefore do not remain active during HTTP. Recovery and
+processing are not one transaction: a processing failure cannot roll back the durable recovery
+commit, and a later per-job failure cannot roll back earlier completion commits. The worker
+iteration performs no batch rollback or recovery compensation. Its immutable composed result
+contains the exact recovery and processing results and derives `recovered_count`, `claimed_count`,
+and `completed_count` without storing ORM objects.
+
+The standalone bounded processing-cycle sequence is:
 
 1. create the claim session;
 2. claim at most `limit` due `pending` jobs;
@@ -254,9 +307,10 @@ exactly-once delivery are not guaranteed. Detailed behavior is documented in [Da
 migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
 documentation](docs/api/index.md).
 
-The bounded cycle is an internal service and runs only when called explicitly. It is not a worker,
-background task, polling loop, scheduler, or automatic retry executor, and it does not invoke
-another cycle by itself.
+The standalone bounded cycle and the one-shot bounded worker iteration are internal services and
+run only when called explicitly. Neither is a long-running worker process, background task,
+polling loop, scheduler, CLI, startup hook, or automatic retry executor, and neither invokes
+another iteration automatically.
 
 ## Technology stack
 
@@ -329,8 +383,8 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 |---|---|
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
-| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, recovery, and `SKIP LOCKED` transaction semantics |
-| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, the explicit bounded processing cycle, stale processing job recovery, per-job completion, duplicate-delivery risk, transaction boundaries, and limitations |
+| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, recovery, bounded worker-iteration orchestration, and `SKIP LOCKED` transaction semantics |
+| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, the [bounded worker iteration](docs/delivery-execution.md#bounded-worker-iteration), standalone recovery and processing, partial progress, duplicate-delivery risk, transaction boundaries, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
