@@ -1,18 +1,20 @@
 # Webhook Delivery Execution
 
-Delivery execution and recovery have five related entry points. `execute_webhook_delivery` performs one HTTP
-attempt and flushes one completed `WebhookDeliveryAttempt` in a caller-owned transaction. The
-internal `execute_webhook_delivery_job` service accepts a previously committed `processing` job,
-uses that execution service, applies one retry decision, and flushes the job transition in the same
-caller-owned transaction. `run_webhook_delivery_processing_cycle` explicitly connects claim and
-completion for one bounded batch. `recover_stale_webhook_delivery_jobs` explicitly returns one
-bounded batch of stale `processing` jobs to `pending` without HTTP or attempt creation. The public
-manual endpoint uses only `execute_webhook_delivery`, commits the attempt, and does not update a
-delivery job.
+Delivery execution and recovery have six related entry points. `execute_webhook_delivery` performs
+one HTTP attempt and flushes one completed `WebhookDeliveryAttempt` in a caller-owned transaction.
+The internal `execute_webhook_delivery_job` service accepts a previously committed `processing`
+job, uses that execution service, applies one retry decision, and flushes the job transition in
+the same caller-owned transaction. `run_webhook_delivery_processing_cycle` explicitly connects
+claim and completion for one bounded batch. `recover_stale_webhook_delivery_jobs` explicitly
+returns one bounded batch of stale `processing` jobs to `pending` without HTTP or attempt creation.
+`run_webhook_worker_iteration` explicitly runs one bounded recovery phase followed by one bounded
+processing phase. The public manual endpoint uses only `execute_webhook_delivery`, commits the
+attempt, and does not update a delivery job.
 
 ## Contents
 
 - [Current execution model](#current-execution-model)
+- [Bounded worker iteration](#bounded-worker-iteration)
 - [Bounded delivery processing cycle](#bounded-delivery-processing-cycle)
 - [Stale processing job recovery](#stale-processing-job-recovery)
 - [Preparation and validation](#preparation-and-validation)
@@ -45,12 +47,173 @@ attempt and transition share one caller-owned PostgreSQL transaction.
 The completion service does not select or claim work. Creating an event stores an immediately due
 `pending` job, and the separate claim service can change due jobs to `processing`. When explicitly
 invoked, the bounded processing cycle connects claim and completion for at most the requested
-limit. Event creation and the public API do not invoke that cycle, and no worker or polling loop
-runs it continuously or executes scheduled retries automatically.
+limit. Event creation and the public API do not invoke that cycle, and no long-running worker or
+polling loop runs it continuously or executes scheduled retries automatically. The internal
+bounded worker iteration can explicitly run one recovery phase and one processing phase, but it
+does not run continuously.
 
 The target can receive the request before the completion transaction is committed. PostgreSQL can
 atomically commit or roll back the attempt and job transition, but it cannot roll back the external
 HTTP request and does not provide exactly-once delivery.
+
+## Bounded worker iteration
+
+### Purpose
+
+`run_webhook_worker_iteration` is a synchronous, framework-independent orchestration service. One
+explicit internal invocation runs exactly one bounded stale-job recovery phase and then exactly
+one bounded delivery processing cycle. It is a one-shot operation: it does not loop, poll, sleep,
+schedule itself, or start automatically.
+
+The service does not import FastAPI or `Settings`. The caller supplies every dependency and
+configuration value.
+
+### Inputs
+
+The caller supplies:
+
+- a session factory;
+- a `WebhookHttpClient`;
+- timezone-aware `iteration_at` and `stale_before` timestamps;
+- independent `recovery_limit` and `processing_limit` values;
+- the HTTP timeout;
+- maximum attempts and base and maximum retry delays;
+- explicit attempt, decision, and monotonic clocks when deterministic timing is required.
+
+### Validation
+
+Before creating a database session, the iteration validates:
+
+- `recovery_limit` is an integer greater than or equal to 1 and is not a Boolean;
+- `processing_limit` is an integer greater than or equal to 1 and is not a Boolean;
+- the timeout is finite and greater than zero;
+- `iteration_at` and `stale_before` are timezone-aware;
+- `iteration_at` is greater than or equal to `stale_before` after UTC normalization.
+
+Invalid orchestration input therefore creates no session, executes no SQL, calls no lower-level
+recovery or processing service, and sends no HTTP request.
+
+### Timestamp semantics
+
+Both timestamps are normalized to UTC before any session is created. The same normalized
+`iteration_at` is passed to recovery as `recovered_at` and to processing as `claimed_at`.
+Recovered jobs receive that instant as both `next_attempt_at` and `updated_at`, making them
+immediately due at the processing cutoff used in the same iteration.
+
+The caller supplies `stale_before`; the iteration does not derive a stale timeout from settings or
+the current clock. It does not read or generate a second orchestration timestamp between phases.
+
+### Recovery phase
+
+The iteration:
+
+1. creates one dedicated recovery session;
+2. calls `recover_stale_webhook_delivery_jobs` exactly once with `stale_before`,
+   `iteration_at` as `recovered_at`, and `recovery_limit`;
+3. commits the bounded recovery batch;
+4. rolls back if recovery execution or recovery commit fails;
+5. always closes the recovery session before processing begins.
+
+Recovery performs no HTTP and creates no delivery attempt. An empty recovery result still commits
+and closes, and the processing phase then runs normally. Closing the recovery session after commit
+also releases its row locks before processing and external HTTP.
+
+### Processing phase
+
+After a successful recovery commit and close, the iteration calls
+`run_webhook_delivery_processing_cycle` exactly once. It forwards `processing_limit`, the same
+normalized `iteration_at` as `claimed_at`, the HTTP and retry settings, and the supplied clocks.
+
+Recovered jobs and jobs that were already due compete under the processing cycle's deterministic
+`next_attempt_at`, `created_at`, and `id` ordering. Recovery does not reserve a processing slot.
+The iteration delegates to the existing cycle rather than duplicating its claim or completion
+logic.
+The independent limits can therefore produce any of these valid outcomes:
+
+- more jobs are recovered than can be processed, leaving some recovered jobs `pending`;
+- more stale jobs are eligible than `recovery_limit` permits, leaving the remainder `processing`;
+- already-pending jobs consume some or all processing capacity;
+- a recovered job is claimed and completed in the same iteration;
+- recovery is empty while processing still claims existing due jobs.
+
+### Result
+
+`WebhookWorkerIterationResult` is an immutable composed snapshot with:
+
+- `recovery`: the immutable `WebhookDeliveryJobRecoveryResult`;
+- `processing`: the immutable `WebhookDeliveryProcessingCycleResult`;
+- `recovered_count`;
+- `claimed_count`;
+- `completed_count`.
+
+The result contains no SQLAlchemy session, ORM object, or mutable collection.
+
+### Failure boundaries
+
+#### Validation failure
+
+The error propagates before a session is created. Neither phase starts.
+
+#### Recovery failure
+
+A recovery execution error rolls back and closes the recovery session. Processing does not start,
+no HTTP request is sent, and the original exception propagates.
+
+#### Recovery commit failure
+
+The recovery transaction is rolled back and its session closes. Processing does not start, no
+claim or completion session is created, no HTTP request is sent, and the original exception
+propagates.
+
+#### Processing failure
+
+The already committed recovery batch remains committed. The processing cycle applies its own
+claim and per-job completion failure boundaries: it rolls back the failing current transaction,
+stops before later jobs, and does not undo earlier committed completions. Claimed but unstarted
+jobs can remain `processing`. The iteration performs no compensation and does not automatically
+run recovery or another iteration.
+
+### Transaction timeline
+
+One iteration uses this ordered transaction sequence:
+
+1. validate all iteration-level inputs without a session;
+2. open the recovery session;
+3. recover and flush at most `recovery_limit` stale jobs;
+4. commit or roll back the recovery transaction;
+5. close the recovery session and release its locks;
+6. invoke exactly one existing bounded processing cycle;
+7. within that cycle, open its claim session, claim and flush at most `processing_limit` due jobs,
+   commit the claim transaction, and close the claim session before HTTP;
+8. for each started job, open a fresh completion session, perform one HTTP attempt and transition,
+   then commit or roll back and close that session;
+9. return the immutable composed result.
+
+No transaction spans recovery, claim, external HTTP, and completion. There is no shared
+iteration-level rollback.
+
+### Delivery limitations
+
+The iteration permits partial progress. A committed recovery cannot be undone by a later
+processing failure, and a committed completion cannot be undone by a later job failure. Jobs
+claimed but not completed remain `processing` until a future explicit recovery makes eligible
+ones `pending`.
+
+External HTTP is not atomic with PostgreSQL. If a target receives a request before the completion
+transaction fails, later stale recovery and redelivery can duplicate that request. The iteration
+does not provide exactly-once delivery, idempotency, or remote-side deduplication.
+
+### Still not implemented
+
+- a long-running worker process or loop;
+- polling, sleep, or graceful shutdown;
+- a worker CLI command, scheduler, or application-startup hook;
+- settings-driven worker limits, cadence, or stale timeout;
+- automatic invocation of an iteration, processing cycle, recovery, or scheduled retry;
+- leases, lease ownership, or heartbeat;
+- parallel job completion;
+- remote delivery verification;
+- exactly-once delivery, idempotency, or replay.
 
 ## Bounded delivery processing cycle
 
@@ -151,7 +314,8 @@ batch transaction or batch rollback, and the cycle does not automatically restor
 `pending`.
 
 The explicit stale processing job recovery service can later restore eligible claimed but not
-completed jobs to `pending`. The bounded cycle does not invoke recovery, and no automatic recovery
+completed jobs to `pending`. The standalone bounded cycle does not invoke recovery. The bounded
+worker iteration invokes recovery before its one processing cycle, but no automatic recovery
 mechanism exists.
 
 ### Failure boundaries
@@ -194,8 +358,8 @@ per-job completion commits. A later completion failure can also leave later jobs
 claimed batch unstarted in `processing`.
 
 `recover_stale_webhook_delivery_jobs` is a synchronous, framework-independent service for one
-explicit bounded recovery batch. It does not run automatically and is not a worker, polling loop,
-scheduler, background task, or application startup hook.
+explicit bounded recovery batch. It does not run automatically and is not a long-running worker,
+polling loop, scheduler, background task, or application startup hook.
 
 ### Cycle inputs
 
@@ -286,7 +450,8 @@ A concrete failure sequence is:
 3. the process stops before the completion transaction commits;
 4. the job remains `processing` without a committed completion;
 5. explicit recovery returns it to `pending`;
-6. a later, separately invoked processing cycle sends the webhook again.
+6. either a later standalone processing cycle or the processing phase of that worker iteration
+   sends the webhook again.
 
 PostgreSQL does not know whether the remote target received the earlier request, and rollback
 cannot undo HTTP. Recovery performs no remote verification, creates no missing attempt, and
@@ -457,8 +622,9 @@ result deterministic, and a pending `next_attempt_at` is normalized to UTC.
 
 `execute_webhook_delivery_job` invokes the policy once after a completed attempt and applies its
 returned values to the `processing` job without recalculating backoff. The public manual endpoint
-does not invoke the policy. No worker automatically invokes completion or executes a scheduled
-retry.
+does not invoke the policy. The one-shot bounded worker iteration can explicitly invoke
+completion through its processing phase, but no long-running worker automatically executes a
+scheduled retry.
 
 ## Delivery job completion
 
@@ -565,9 +731,10 @@ The existing bounded processing cycle:
 6. call `execute_webhook_delivery_job` to perform HTTP and prepare the attempt plus transition;
 7. commit or roll back the current completion transaction before another job starts.
 
-This sequence is not automatic. There is no worker loop, the claim service does not invoke
-completion, and completion does not invoke claim; the bounded cycle must be called explicitly. The
-claim transaction therefore does not retain row locks during the external HTTP request.
+This sequence is not automatic. There is no long-running worker loop, the claim service does not
+invoke completion, and completion does not invoke claim; the standalone bounded cycle or bounded
+worker iteration must be called explicitly. The claim transaction therefore does not retain row
+locks during the external HTTP request.
 
 ## Error handling
 
@@ -639,9 +806,17 @@ caller-owned session, recovery cutoff, recovered timestamp, and limit. No API ro
 creation path, manual delivery route, or processing cycle invokes recovery. A recovered `pending`
 job requires a later separate explicit processing-cycle invocation for delivery.
 
+Internal application code can instead invoke `run_webhook_worker_iteration` with a session
+factory, HTTP client, iteration and stale-cutoff timestamps, independent recovery and processing
+limits, timeout, retry settings, and clocks. One call explicitly commits and closes one recovery
+phase before invoking one processing cycle. No public API route invokes the worker iteration.
+
 ## Current limitations
 
-- No worker or polling loop
+- No long-running worker process or loop
+- No polling, sleep, or graceful shutdown
+- No worker CLI, scheduler, or application-startup hook
+- No automatic worker-iteration invocation
 - No automatic bounded-cycle invocation
 - No automatic stale processing job recovery invocation
 - No automatic execution of a scheduled `pending` retry

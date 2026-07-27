@@ -2,10 +2,11 @@
 
 This documentation covers local development, PostgreSQL persistence, atomic event and initial job
 creation, delivery job claiming, manual webhook execution, internal atomic attempt-plus-job
-completion, the explicitly invoked bounded processing cycle, partial-progress semantics, retry
-scheduling and terminal transitions, explicit stale processing job recovery, its
-duplicate-delivery limitation, and the currently available HTTP API for Reliable Webhook Delivery
-Service.
+completion, the explicitly invoked bounded processing cycle, the one-shot
+[bounded worker iteration](delivery-execution.md#bounded-worker-iteration), partial-progress
+semantics, retry scheduling and terminal transitions, explicit stale processing job recovery,
+its duplicate-delivery limitation, and the currently available HTTP API for Reliable Webhook
+Delivery Service.
 
 ## Start here
 
@@ -21,7 +22,8 @@ Read the documentation in this order:
 - [Development setup](development.md) — install, configure, run, and validate the project locally.
 - [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
   migrations, atomic event and job transactions, the current schema, and delivery job claiming
-  and recovery transaction semantics with `SKIP LOCKED`.
+  and recovery transaction semantics with `SKIP LOCKED`, including the separate recovery, claim,
+  and per-job completion boundaries used by a bounded worker iteration.
 - [Webhook delivery execution](delivery-execution.md) — manual execution,
   `execute_webhook_delivery_job`, the
   [bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle), separate
@@ -29,7 +31,10 @@ Read the documentation in this order:
   `dead_letter` transitions, and
   [stale processing job recovery](delivery-execution.md#stale-processing-job-recovery). Recovery
   is an explicit internal service rather than an automatic mechanism; the guide also explains the
-  duplicate-delivery risk after an uncertain earlier HTTP result.
+  [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), which explicitly
+  performs recovery-before-processing with independent limits and separate transactions. This
+  one-shot orchestration is not a long-running worker; partial progress and the duplicate-delivery
+  risk after an uncertain earlier HTTP result remain.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
@@ -58,6 +63,7 @@ Read the documentation in this order:
 - [Review SKIP LOCKED concurrency semantics](database.md#postgresql-locking)
 - [Review delivery execution flow](delivery-execution.md#current-execution-model)
 - [Review the bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle)
+- [Review the bounded worker iteration](delivery-execution.md#bounded-worker-iteration)
 - [Review stale processing job recovery](delivery-execution.md#stale-processing-job-recovery)
 - [Review partial-progress semantics](delivery-execution.md#partial-progress)
 - [Review delivery transaction ownership](delivery-execution.md#delivery-transaction-ownership)

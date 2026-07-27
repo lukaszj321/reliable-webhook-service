@@ -12,6 +12,7 @@ PostgreSQL stores the application's persistent data, and Alembic manages the dat
 - [Atomic event and delivery job creation](#atomic-event-and-delivery-job-creation)
 - [Delivery job claiming](#delivery-job-claiming)
 - [Stale processing job recovery](#stale-processing-job-recovery)
+- [Bounded worker iteration transaction orchestration](#bounded-worker-iteration-transaction-orchestration)
 - [Bounded delivery processing cycle](#bounded-delivery-processing-cycle)
 - [ORM behavior](#orm-behavior)
 - [Validation boundary](#validation-boundary)
@@ -153,10 +154,10 @@ snapshotted UUIDs in deterministic order. Each claimed job receives a separate c
 transaction that can commit `succeeded`, retryable `pending` with `next_attempt_at`, or
 `dead_letter`.
 
-No worker, polling loop, or automatic cycle invocation exists. A scheduled `pending` retry only
-records eligibility for a future explicit or planned invocation. Stale processing job recovery is
-available only through an explicit internal service; automatic recovery invocation and replay are
-not implemented.
+An internal one-shot bounded worker iteration can explicitly orchestrate one recovery batch and
+then one processing cycle. No long-running worker process, polling loop, or automatic invocation
+exists. A scheduled `pending` retry only records eligibility for a future explicit invocation.
+Automatic recovery invocation and replay are not implemented.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -196,9 +197,11 @@ implements `pending` to `processing`. The completion service implements `process
 `dead_letter`. The explicitly invoked bounded cycle owns their separate transaction boundaries:
 one claim commit followed by one commit or rollback for each started job. Schema constraints
 continue to enforce the allowed statuses and the required nullability of `next_attempt_at`, but
-they do not provide this orchestration. The worker lifecycle remains unimplemented, and
-`next_attempt_at` is not polled or executed automatically. An explicit recovery service can return
-sufficiently old `processing` jobs to `pending`; database constraints do not invoke it.
+they do not provide this orchestration. The one-shot bounded worker iteration provides explicit
+recovery-before-processing orchestration, while a long-running worker lifecycle remains
+unimplemented and `next_attempt_at` is not polled or executed automatically. An explicit recovery
+service can return sufficiently old `processing` jobs to `pending`; database constraints do not
+invoke it.
 
 ### webhook_delivery_attempts
 
@@ -345,7 +348,7 @@ PostgreSQL continues to manage the job's `created_at` and `updated_at` server de
 The public response contains only the `WebhookEvent`: `id`, `endpoint_id`, `event_type`, `payload`,
 and `created_at`. It does not expose the job, a job ID, job status, or `next_attempt_at`. No public
 delivery-job API exists, and creating the durable job does not execute delivery, create an attempt,
-invoke claiming, apply retry policy, or start a worker.
+invoke claiming, apply retry policy, or invoke the bounded worker iteration.
 
 ## Delivery job claiming
 
@@ -399,11 +402,13 @@ session. Row-level locks remain active until the caller commits or rolls back:
 `run_webhook_delivery_processing_cycle` supplies this transaction boundary when explicitly called.
 It snapshots the claimed UUIDs, commits and closes its dedicated claim session, and only then opens
 the first per-job completion session and permits external HTTP. The claim row locks therefore do
-not remain open during HTTP. No worker or polling loop invokes this lifecycle automatically.
+not remain open during HTTP. The bounded worker iteration can invoke this lifecycle once after its
+recovery session closes, but no long-running worker or polling loop invokes it automatically.
 
 ### Current limitations
 
-- No worker or polling loop invokes the bounded cycle.
+- No long-running worker or polling loop invokes the bounded cycle automatically; the one-shot
+  bounded worker iteration can invoke it once through an explicit internal call.
 - Newly created pending jobs are not claimed or consumed automatically.
 - The standalone claim service does not execute HTTP or complete a job.
 - A retryable `pending` schedule is not executed without a future explicit or planned invocation.
@@ -417,8 +422,9 @@ not remain open during HTTP. No worker or polling loop invokes this lifecycle au
 A bounded processing cycle can leave jobs as `processing` after its claim transaction commits but
 before every per-job completion commits. A process failure in that interval has the same effect.
 The internal synchronous `recover_stale_webhook_delivery_jobs` service provides one explicit
-bounded recovery batch; no worker, poller, scheduler, startup hook, or database constraint invokes
-it automatically.
+bounded recovery batch. The bounded worker iteration can call it once as its recovery phase, but
+no long-running worker, poller, scheduler, startup hook, or database constraint invokes it
+automatically.
 
 Recovery eligibility is exact and inclusive:
 
@@ -444,17 +450,77 @@ a caller rollback restores the previously committed `processing` state. Row lock
 until that commit or rollback, and the caller then closes the session. The service itself does not
 commit, roll back, or close.
 
-Recovery only makes a job eligible for later work. A separate explicit processing-cycle invocation
-is required to deliver it. PostgreSQL cannot determine whether an earlier HTTP request reached the
-remote target. If it did but completion was not committed, later processing of the recovered job
-can cause duplicate delivery. Recovery performs no remote verification and does not provide
-idempotency or exactly-once delivery.
+Recovery only makes a job eligible for later work. A standalone recovery caller must later invoke
+the processing cycle separately; the one-shot bounded worker iteration explicitly sequences that
+cycle immediately after a successful recovery commit and session close. PostgreSQL cannot
+determine whether an earlier HTTP request reached the remote target. If it did but completion was
+not committed, later processing of the recovered job can cause duplicate delivery. Recovery
+performs no remote verification and does not provide idempotency or exactly-once delivery.
+
+## Bounded worker iteration transaction orchestration
+
+`run_webhook_worker_iteration` is a synchronous internal one-shot orchestration service. One
+explicit invocation runs one bounded stale-job recovery phase and, only after that phase commits
+and closes, one bounded delivery processing cycle. It does not wrap the whole iteration in a
+shared transaction.
+
+Before creating any session, the service validates the independent recovery and processing limits,
+the finite positive HTTP timeout, and the timezone awareness of `iteration_at` and `stale_before`.
+It normalizes both timestamps to UTC and requires `iteration_at >= stale_before`.
+
+The recovery phase:
+
+1. creates a dedicated recovery session;
+2. calls `recover_stale_webhook_delivery_jobs` exactly once with `recovery_limit`;
+3. uses the normalized `stale_before` as the inclusive recovery cutoff;
+4. uses the normalized `iteration_at` as `recovered_at`, which becomes both `next_attempt_at` and
+   `updated_at` for each recovered job;
+5. commits the recovery batch, or rolls it back if recovery execution or commit fails;
+6. always closes the recovery session before processing and external HTTP can begin.
+
+The recovery commit releases its row locks before the processing phase. Recovery creates no
+delivery attempt and performs no HTTP. An empty recovery batch still commits and closes, after
+which processing continues.
+
+The processing phase calls `run_webhook_delivery_processing_cycle` exactly once with
+`processing_limit`. It uses the same normalized `iteration_at` as `claimed_at`. A recovered job is
+therefore immediately eligible for the same iteration, but it competes with all other due
+`pending` jobs under the processing cycle's deterministic ordering and limit.
+
+The two limits are independent. Recovering a job does not reserve processing capacity, and a
+processing limit smaller than the recovery limit can leave some recovered jobs as `pending`.
+Likewise, already-pending due jobs can consume processing capacity before a recovered job. A
+recovery limit smaller than the eligible stale set leaves the remaining stale jobs as
+`processing`.
+
+Recovery and processing have separate transaction boundaries:
+
+- recovery uses one dedicated caller-managed transaction for the bounded recovery batch;
+- processing uses one claim transaction and one fresh completion transaction per started job;
+- no database transaction spans recovery, claim, HTTP, and completion;
+- a recovery failure prevents processing from starting;
+- once recovery commits, a later processing failure cannot undo it;
+- previously committed per-job completions remain committed if a later completion fails.
+
+A processing failure can leave claimed but unstarted jobs as `processing`. A later explicit
+recovery invocation can return them to `pending` after they satisfy its stale cutoff; neither the
+worker iteration nor the database triggers that recovery automatically.
+
+The immutable `WebhookWorkerIterationResult` composes the immutable recovery and processing
+results and exposes their recovered, claimed, and completed counts. It contains no session,
+mutable collection, or ORM object.
+
+This design permits partial progress. It provides no batch rollback, compensating transaction,
+automatic second iteration, automatic stale recovery after a processing failure, or exactly-once
+delivery. If an external request succeeds but its completion transaction fails, a later recovery
+and delivery can duplicate that request.
 
 ## Bounded delivery processing cycle
 
 `run_webhook_delivery_processing_cycle` is a synchronous internal service that performs one
-explicitly invoked bounded batch. It is not a worker, polling loop, scheduler, or background task,
-and it does not start another cycle automatically.
+explicitly invoked bounded batch. It is the processing phase used by the bounded worker iteration
+and can also be invoked independently. It is not a long-running worker, polling loop, scheduler,
+or background task, and it does not start another cycle automatically.
 
 ### Job lifecycle
 
@@ -546,7 +612,8 @@ through SQLAlchemy's ORM configuration.
 - A unique constraint allows at most one job per event.
 - Deleting an event removes its job through database `ON DELETE CASCADE`.
 - `SessionFactory` continues to use `expire_on_commit=False`.
-- No public job API, automatic cycle invocation, polling loop, or worker currently exists.
+- No public job API, automatic cycle invocation, long-running worker, or polling loop currently
+  exists. The bounded worker iteration is an explicitly invoked one-shot internal service.
 - No automatic recovery invocation, lease ownership, or heartbeat currently exists.
 
 **WebhookDeliveryAttempt**
@@ -563,8 +630,9 @@ through SQLAlchemy's ORM configuration.
   one existing event without creating or modifying them. A top-level
   `GET /webhook-delivery-attempts` endpoint does not exist.
 - Synchronous execution of one delivery exists as an application service and through the public
-  manual POST endpoint. It is not triggered automatically after event creation. Workers,
-  background processing, automatic retry execution, and replay are not implemented.
+  manual POST endpoint. It is not triggered automatically after event creation. The internal
+  bounded worker iteration can execute one explicit recovery-and-processing sequence, but
+  long-running background processing, automatic retry execution, and replay are not implemented.
 
 **Shared persistence configuration**
 
