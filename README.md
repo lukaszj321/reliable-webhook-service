@@ -44,8 +44,7 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Caller-owned claim transaction: the service flushes changes but does not commit or roll back
 - Real PostgreSQL tests with two independent sessions confirm locked jobs are skipped and claims do
   not overlap
-- No worker, polling loop, automatic claim invocation, automatic HTTP execution, completion
-  handling, automatic retry rescheduling, stale `processing` recovery, or public job API exists
+- Claiming is a separate transaction that must finish before external HTTP execution begins
 - `WebhookDeliveryAttempt` ORM model and `webhook_delivery_attempts` PostgreSQL table
 - Completed delivery attempt persistence linked to `WebhookEvent` through a foreign key
 - PostgreSQL constraints for attempt number, outcome, HTTP response status, and duration
@@ -59,17 +58,26 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   timezone-aware attempt timestamp
 - Public manual `POST /webhook-events/{event_id}/delivery-attempts` endpoint that synchronously
   executes exactly one delivery, commits once, refreshes the attempt after commit, and returns it
+- Manual execution uses `execute_webhook_delivery` directly and does not update a
+  `WebhookDeliveryJob`
 - HTTP 201 for both committed `succeeded` and `failed` delivery attempts
 - Preparation errors occur before HTTP execution and before a delivery attempt is created
-- The caller-owned transaction boundary can let a future worker atomically persist an attempt and
-  a delivery job transition; attempt-plus-job completion is not implemented, and current delivery
-  execution does not update `WebhookDeliveryJob`
+- Internal, framework-independent `execute_webhook_delivery_job` validates an existing committed
+  `processing` job and calls `execute_webhook_delivery` exactly once
+- After the completed attempt, internal completion obtains exactly one retry decision and applies
+  `processing` to `succeeded`, `pending` with the policy's exact `next_attempt_at`, or
+  `dead_letter`
+- The new `WebhookDeliveryAttempt` and existing `WebhookDeliveryJob` transition share one
+  caller-owned completion transaction: delivery execution flushes the attempt, job completion
+  flushes the transition, and the caller commits or rolls back
+- Real PostgreSQL tests confirm pre-commit invisibility, joint post-commit visibility, and rollback
+  of both the attempt and job transition to the previously committed `processing` state
 - Configurable positive, finite `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` application setting, with a
   default of 10.0 seconds
 - Configurable total attempt limit and exponential-backoff base and maximum delay settings
 - Pure, deterministic retry policy with no jitter that returns `pending`, `succeeded`, or
   `dead_letter` decisions and normalizes timezone-aware `next_attempt_at` values to UTC
-- Retry policy is not connected to a worker or automatic delivery-job handling
+- The retry policy is connected to internal job completion but is not invoked automatically
 - HTTP 404 for a missing event and HTTP 409 for a missing or inactive endpoint before execution
 - Manual-only execution: creating a webhook event does not trigger delivery automatically
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
@@ -77,13 +85,18 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
   event, and does not create or modify attempts
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
+- No worker, polling loop, automatic claim invocation, automatic completion invocation, automatic
+  retry execution, stale `processing` recovery, or public delivery-job API exists
 
 ## Planned scope
 
 The following capabilities are planned but are not currently implemented:
 
-- Asynchronous delivery processing
-- Automatic retry execution and delivery-job rescheduling after failed attempts
+- Worker or background delivery processing
+- Automatic claim invocation
+- Automatic completion invocation for claimed jobs
+- Automatic execution of retries already scheduled as `pending`
+- Stale `processing` recovery
 - Idempotency
 - Automatic delivery execution after event creation
 - Manual replay
@@ -117,39 +130,60 @@ flowchart LR
     Event --> PostgreSQL
     Job --> PostgreSQL
     App --> AttemptPOST["FastAPI<br/>POST /webhook-events/{event_id}/delivery-attempts"]
-    AttemptPOST -->|"session + HTTP client + timeout"| Execute["execute_webhook_delivery"]
-    AttemptPOST -->|"provides caller-owned transaction"| DeliverySession["SQLAlchemy session"]
+    AttemptPOST -->|"calls manual execution"| Execute["execute_webhook_delivery"]
+    AttemptPOST -->|"provides session; one commit"| DeliverySession["Manual SQLAlchemy session"]
     App --> AttemptGET["FastAPI<br/>GET /webhook-events/{event_id}/delivery-attempts"]
     AttemptGET --> AttemptSession["SQLAlchemy session"]
     AttemptSession -->|"checks existing WebhookEvent"| Event
     AttemptSession -->|"reads stored completed attempts"| Attempt["WebhookDeliveryAttempt"]
     Attempt --> PostgreSQL
     Execute --> Prepare["prepare_webhook_delivery"]
-    Prepare -->|"reads WebhookEvent and WebhookEndpoint"| DeliverySession
+    Prepare -->|"reads event and active endpoint"| DeliveryData["Stored delivery data"]
+    DeliveryData --> PostgreSQL
     Execute --> HTTPClient["WebhookHttpClient"]
     HTTPClient -->|"exactly one HTTP POST"| Target["Endpoint target URL"]
     Target --> Classification["Classify delivery result"]
     Classification -->|"creates one completed attempt"| Attempt
-    Execute -->|"add + flush"| DeliverySession
-    DeliverySession --> Attempt
-    AttemptPOST -->|"one commit"| DeliverySession
+    DeliverySession -->|"attempt add + flush through Execute"| Attempt
     AttemptPOST -->|"refresh after commit"| Attempt
+    InternalCaller["Internal application caller<br/>(not a worker loop)"]
+    InternalCaller -->|"owns transaction; commit or rollback"| CompletionSession["Completion SQLAlchemy session"]
+    InternalCaller -->|"invokes for committed processing job"| JobExecution["execute_webhook_delivery_job"]
+    JobExecution -->|"uses session; applies job update"| CompletionSession
+    CompletionSession -->|"loads processing job; flushes transition"| Job
+    JobExecution -->|"calls exactly once"| Execute
+    CompletionSession -->|"attempt add + flush through Execute"| Attempt
+    JobExecution -->|"completed outcome + attempt number"| RetryPolicy["decide_webhook_retry"]
+    RetryPolicy -->|"status + next_attempt_at"| JobExecution
+    ClaimCaller["Internal claim caller<br/>(no automatic invocation)"]
+    ClaimCaller -->|"owns claim transaction; commits before HTTP"| ClaimSession["Claim SQLAlchemy session"]
+    ClaimCaller --> ClaimService["claim_due_webhook_delivery_jobs"]
+    ClaimService -->|"uses caller session"| ClaimSession
+    ClaimSession -->|"SELECT FOR UPDATE SKIP LOCKED<br/>pending to processing + flush"| Job
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
-The event route uses one caller-owned transaction to flush a `WebhookEvent` and its `pending`
-`WebhookDeliveryJob`, then commits both together. The job uses the generated `event.id`, and its
-`next_attempt_at` represents the same instant as `event.created_at`. This makes the job immediately
-due, but the route does not claim it or execute delivery.
+**Event creation transaction.** The event route flushes one `WebhookEvent` and its initial
+`pending` `WebhookDeliveryJob`, then commits both together. No HTTP request occurs.
 
-The manual POST route supplies the database session, HTTP client, and configured timeout to
-`execute_webhook_delivery`. The execution service performs one outgoing HTTP POST, creates the
-completed attempt, and adds and flushes it in the caller-owned transaction. The manual route owns
-that transaction: it commits the attempt exactly once and then refreshes it. The GET route remains
-read-only. The manual route does not invoke the claim service, the retry policy is not connected to
-the delivery job lifecycle, and no worker exists. Detailed behavior is documented in [Database and
-migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
-documentation](docs/api/index.md).
+**Manual attempt transaction.** The manual POST route calls `execute_webhook_delivery`, which
+performs one external HTTP request and flushes one completed attempt. The route commits and
+refreshes the attempt. It does not update the delivery job.
+
+**Internal completion transaction.** An internal caller passes a previously committed
+`processing` job to `execute_webhook_delivery_job`. The service calls `execute_webhook_delivery`
+once, receives one retry decision, updates the job, and flushes the transition. Caller commit makes
+the attempt and transition visible together; caller rollback removes the attempt and restores the
+previously committed `processing` job. The endpoint and event remain.
+
+**Claim transaction.** A separate caller can claim due `pending` jobs with `SELECT FOR UPDATE SKIP
+LOCKED`, flush `pending` to `processing`, and commit before any external HTTP request. No automatic
+orchestrator connects claim and completion, and no worker or polling loop exists.
+
+The external HTTP request is not part of the PostgreSQL transaction. A rollback cannot undo an
+HTTP request that already reached the target, so exactly-once delivery is not guaranteed. Detailed
+behavior is documented in [Database and migrations](docs/database.md), [Webhook delivery
+execution](docs/delivery-execution.md), and [API documentation](docs/api/index.md).
 
 ## Technology stack
 
@@ -223,7 +257,7 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [Documentation index](docs/index.md) | Main documentation portal |
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
 | [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, and `SKIP LOCKED` transaction semantics |
-| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution flow, result outcomes, retry decisions, delivery job claiming infrastructure, transaction ownership, and limitations |
+| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, internal processing-job completion, retry decisions, claim and completion transaction boundaries, and limitations |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |

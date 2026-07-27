@@ -1,8 +1,11 @@
 # Webhook Delivery Execution
 
-The application provides two connected execution levels: the synchronous
-`execute_webhook_delivery` application service and a public manual HTTP endpoint that invokes the
-service and returns one persisted `WebhookDeliveryAttempt`.
+Delivery execution has three related entry points. `execute_webhook_delivery` performs one HTTP
+attempt and flushes one completed `WebhookDeliveryAttempt` in a caller-owned transaction. The
+internal `execute_webhook_delivery_job` service accepts a previously committed `processing` job,
+uses that execution service, applies one retry decision, and flushes the job transition in the same
+caller-owned transaction. The public manual endpoint uses only `execute_webhook_delivery`, commits
+the attempt, and does not update a delivery job.
 
 ## Contents
 
@@ -14,6 +17,7 @@ service and returns one persisted `WebhookDeliveryAttempt`.
 - [Transaction ownership](#transaction-ownership)
 - [Attempt numbering](#attempt-numbering)
 - [Retry decision policy](#retry-decision-policy)
+- [Delivery job completion](#delivery-job-completion)
 - [Delivery job claiming](#delivery-job-claiming)
 - [Error handling](#error-handling)
 - [Invocation](#invocation)
@@ -22,18 +26,24 @@ service and returns one persisted `WebhookDeliveryAttempt`.
 
 ## Current execution model
 
-Delivery execution is synchronous. One service call performs at most one HTTP request, and every
-request that is actually executed ends with an attempt to persist one completed delivery attempt.
-The public manual POST route calls that service with a database session, HTTP client, and configured
-timeout. The execution service adds and flushes the completed attempt in the caller-owned
-transaction, and the manual route commits it. The service does not retry requests, and creating a
-webhook event does not trigger delivery automatically. Event creation atomically persists one
-`WebhookEvent` and one immediately due `pending` `WebhookDeliveryJob`, but it does not call
-`execute_webhook_delivery`, perform HTTP, or create a `WebhookDeliveryAttempt`.
+Delivery execution is synchronous. `execute_webhook_delivery` performs at most one external HTTP
+request and flushes one completed attempt. The public manual POST route calls it with a database
+session, HTTP client, and timeout, then commits and refreshes the attempt without changing the
+delivery job.
 
-The external endpoint can receive the request before the attempt is committed, so HTTP execution
-and the database commit are not one atomic operation and this design does not provide exactly-once
-delivery.
+The framework-independent `execute_webhook_delivery_job` service is an internal completion path,
+not an endpoint, background service, or worker. Its caller supplies a previously committed
+`processing` job ID, session, HTTP client, timeout, retry settings, and clocks. The service calls
+`execute_webhook_delivery` once, applies one retry decision, and flushes the job transition. The
+attempt and transition share one caller-owned PostgreSQL transaction.
+
+The completion service does not select or claim work. Creating an event stores an immediately due
+`pending` job, and the separate claim service can change due jobs to `processing`, but no worker or
+polling loop connects event creation, claim, completion, or scheduled retry execution.
+
+The target can receive the request before the completion transaction is committed. PostgreSQL can
+atomically commit or roll back the attempt and job transition, but it cannot roll back the external
+HTTP request and does not provide exactly-once delivery.
 
 ## Preparation and validation
 
@@ -106,23 +116,40 @@ rollback of the attempt transaction. A flush does not guarantee a commit.
 
 ## Transaction ownership
 
+### `execute_webhook_delivery`
+
 `execute_webhook_delivery` receives the caller's session. After completing the HTTP request and
 classifying its result, the execution service performs `add`, `flush`, and `return`. It does not
 commit, roll back, refresh, close the session, or create another session.
 
+### Manual route
+
 The public manual route calls the execution service, performs exactly one `commit` after receiving
 the attempt, refreshes that attempt after the commit, and returns the response. The route does not
-perform its own rollback.
+perform its own rollback or update `WebhookDeliveryJob`.
 
 A flush error propagates to the caller before commit. A commit error also propagates and prevents
 refresh. A refresh error propagates after the commit has succeeded; no rollback can undo that
 completed commit. Management of a failed or unfinished transaction remains with the caller and the
 existing session dependency.
 
-This boundary allows a future worker to prepare a completed delivery attempt and a delivery job
-transition in one caller-owned transaction after HTTP execution. That attempt-plus-job completion
-does not exist yet: this issue does not update `WebhookDeliveryJob` or connect delivery execution
-to the delivery job lifecycle.
+### `execute_webhook_delivery_job`
+
+The internal completion service receives the caller's session, loads an existing `processing` job,
+calls `execute_webhook_delivery`, obtains and applies a retry decision, flushes the job transition,
+and returns the same job and attempt in `WebhookDeliveryJobExecutionResult`. It does not commit,
+roll back, refresh, close the session, or create another session.
+
+After both flushes, the caller session sees the completed attempt and updated job. Before caller
+commit, an independent session does not see the attempt and still sees the previously committed
+`processing` state, schedule, and update timestamp. Caller commit makes the attempt and job
+transition visible together.
+
+Caller rollback removes the uncommitted attempt and restores the job's previously committed
+`processing` state. The endpoint and event were committed before completion and remain. The
+external HTTP request may already have reached the target; PostgreSQL rollback cannot undo it.
+Consequently, the transaction protects database consistency but does not guarantee exactly-once
+delivery.
 
 ## Attempt numbering
 
@@ -134,10 +161,11 @@ Concurrent attempt-number allocation remains outside the current scope.
 
 ## Retry decision policy
 
-The retry decision policy is separate from `execute_webhook_delivery`, which continues to execute
-exactly one HTTP request. After an attempt is complete, the pure policy accepts its `outcome`,
-`attempt_number`, an explicit timezone-aware `decision_at`, and the retry settings. It does not
-perform HTTP, read the system time, write to PostgreSQL, or update `WebhookDeliveryJob`.
+The retry decision policy remains pure and separate from `execute_webhook_delivery`, which
+continues to execute exactly one HTTP request. After an attempt is complete, the policy accepts its
+`outcome`, `attempt_number`, an explicit timezone-aware `decision_at`, and the retry settings. It
+does not perform HTTP, read the system time, write to PostgreSQL, or update
+`WebhookDeliveryJob` itself.
 
 The policy returns an immutable `RetryDecision` containing `status` and `next_attempt_at`:
 
@@ -166,12 +194,79 @@ grow up to the 300-second cap, and very large attempt numbers are safely capped.
 randomness, sleep, or implicit current-time lookup. Passing `decision_at` explicitly makes the
 result deterministic, and a pending `next_attempt_at` is normalized to UTC.
 
+`execute_webhook_delivery_job` invokes the policy once after a completed attempt and applies its
+returned values to the `processing` job without recalculating backoff. The public manual endpoint
+does not invoke the policy. No worker automatically invokes completion or executes a scheduled
+retry.
+
+## Delivery job completion
+
+### Entry conditions
+
+`execute_webhook_delivery_job` requires an existing, previously committed
+`WebhookDeliveryJob` whose status is exactly `processing`. It does not claim jobs.
+
+- A missing job raises `WebhookDeliveryJobNotFoundError` with
+  `Webhook delivery job not found`.
+- A job in any status other than `processing` raises
+  `WebhookDeliveryJobNotProcessingError` with
+  `Webhook delivery job is not processing`.
+
+Both validations happen before HTTP, attempt creation, or a job transition.
+
+### Execution flow
+
+The internal service performs this sequence:
+
+1. load `WebhookDeliveryJob` with `session.get`;
+2. validate that its status is `processing`;
+3. call `execute_webhook_delivery` exactly once;
+4. let that service add and flush one completed attempt;
+5. obtain the decision timestamp;
+6. call `decide_webhook_retry` exactly once;
+7. assign `job.status` from the decision;
+8. assign `job.next_attempt_at` from the decision;
+9. set `job.updated_at` to the decision instant normalized to UTC;
+10. flush the job transition;
+11. return `WebhookDeliveryJobExecutionResult`;
+12. leave commit or rollback to the caller.
+
+The result contains exactly the existing `job` and the new `attempt`.
+
+### State transitions
+
+| Attempt result | Retry condition | Job status | `next_attempt_at` |
+|---|---|---|---|
+| `succeeded` | Any valid attempt number | `succeeded` | `null` |
+| `failed` | `attempt_number < max_attempts` | `pending` | Exact policy timestamp |
+| `failed` | `attempt_number >= max_attempts` | `dead_letter` | `null` |
+
+`max_attempts` includes the first attempt. Backoff comes only from the existing retry policy; the
+completion service neither duplicates nor adjusts it. A `pending` schedule is the exact timestamp
+returned by the policy, while `updated_at` is the decision timestamp normalized to UTC.
+
+### Transaction behavior
+
+Real PostgreSQL integration tests verify pre-commit invisibility, joint post-commit visibility, and
+caller rollback of both the attempt and job transition. They cover committed `succeeded`,
+retryable `pending`, and final `dead_letter` transitions. After rollback, the endpoint and event
+remain and the job returns to its previously committed `processing` state. Every accepted
+completion performs exactly one external HTTP request.
+
+### Failure behavior
+
+Delivery preparation errors propagate without wrapping. An inactive endpoint creates no attempt
+and leaves the job unchanged. Attempt flush errors, retry policy validation errors, and job flush
+errors also propagate without changing their type. The caller is responsible for rolling back a
+failed transaction; the service does not catch broad database exceptions or reset the job
+automatically.
+
 ## Delivery job claiming
 
 `claim_due_webhook_delivery_jobs` is a synchronous internal application service separate from
-`execute_webhook_delivery`. Claiming does not perform HTTP, while `execute_webhook_delivery`
-continues to perform exactly one manual request. The retry policy remains pure decision logic.
-These components are not connected by a worker.
+completion. Claiming does not perform HTTP, and `execute_webhook_delivery_job` does not invoke the
+claim service. The retry policy remains pure decision logic even though completion applies its
+result to a job. No worker connects these components.
 
 The normal `POST /webhook-events` path supplies the initial `pending` jobs. Their
 `next_attempt_at` represents the same instant as `event.created_at`, so they are immediately due
@@ -197,12 +292,22 @@ With concurrent claimers, session A can lock the first due job while session B s
 later unlocked due jobs. Real PostgreSQL integration tests verify that the two returned ID sets do
 not overlap. This is internal infrastructure, not a public endpoint.
 
-A future worker should commit a claim before invoking `execute_webhook_delivery`. It should not
-hold the claim transaction or row-level locks while waiting for an external HTTP request. No worker
-currently performs this sequence. Claiming alone does not execute HTTP, create an attempt, or
-perform a completion transition.
+A future orchestrator would:
+
+1. claim due jobs in a claim transaction;
+2. commit that claim transaction;
+3. release its row locks;
+4. start a separate completion transaction for a selected `processing` job;
+5. call `execute_webhook_delivery_job` to perform HTTP and prepare the attempt plus transition;
+6. commit or roll back the completion transaction.
+
+This sequence is not automatic. There is no worker loop, the claim service does not invoke
+completion, and completion does not invoke claim. The claim transaction therefore does not retain
+row locks during the external HTTP request.
 
 ## Error handling
+
+### Manual route errors
 
 - Preparation errors occur before the request and do not create an attempt.
 - Expected delivery failures, including non-2xx responses and transport errors, create a completed
@@ -215,6 +320,19 @@ perform a completion transition.
 - The execution service and manual route do not translate database errors into the documented
   domain `HTTPException` responses.
 - The manual route does not perform rollback.
+
+### Internal completion errors
+
+- A missing job raises `WebhookDeliveryJobNotFoundError`.
+- A non-`processing` job raises `WebhookDeliveryJobNotProcessingError`.
+- Delivery preparation errors propagate before an attempt or transition.
+- Retry policy validation errors propagate after the completed attempt is flushed but before the
+  job is changed.
+- Attempt flush and job flush errors propagate to the caller.
+- These internal application and database errors have no assigned HTTP status because completion
+  is not a public endpoint.
+- The completion service does not use broad exception handling or perform rollback; transaction
+  recovery belongs to the caller.
 
 ## Invocation
 
@@ -243,30 +361,31 @@ Preparation errors occur before an outgoing request and do not create an attempt
 `POST /webhook-events` atomically stores an event and its initial `pending` delivery job. It does
 not call the delivery service or invoke the manual delivery endpoint automatically.
 
+Internal application code can invoke `execute_webhook_delivery_job` without a public route. The
+caller supplies its `Session`, a `job_id`, HTTP client, timeout, retry settings, and clocks. The
+service does not import `Settings`; timeout and retry configuration are explicit caller
+arguments.
+
 ## Current limitations
 
-- No automatic delivery trigger
-- The delivery job claiming service exists, but no worker or polling loop invokes it
-- No worker consumes newly created pending jobs
+- No worker or polling loop
 - No automatic claim invocation
-- No automatic HTTP execution for newly created jobs
-- Claiming does not execute HTTP or perform a completion transition
-- Retry policy and backoff calculation exist, but they are not connected to claiming and no
-  automatic retry execution invokes them
-- No attempt-plus-job completion transaction
-- No delivery job success transition after a succeeded attempt
-- No retry rescheduling or dead-letter transition performed by a worker
-- No automatic retry policy invocation
-- No exactly-once delivery; caller-owned transaction alone cannot prevent resending after a crash
-  between the external HTTP request and the database commit
+- No automatic completion invocation
+- No automatic execution of a scheduled `pending` retry
 - No stale `processing` recovery, lease, or heartbeat
-- No background worker
-- No replay
+- No exactly-once delivery
+- A crash after external HTTP but before commit can cause a later resend
+- No concurrent attempt-number allocation protection beyond the database unique constraint
 - No idempotency
-- No concurrent attempt-number allocation
+- No replay
 - No request signing
 - No custom headers
 - No response body persistence
+- No public delivery-job API
+
+Retry scheduling exists when internal completion is invoked explicitly: a retryable failed attempt
+changes its job from `processing` to `pending` with the policy's `next_attempt_at`. Nothing
+automatically invokes or executes that scheduled retry.
 
 ## Navigation
 

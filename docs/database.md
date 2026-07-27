@@ -144,9 +144,15 @@ represents durable non-terminal or terminal processing state, but its existence 
 webhook.
 
 The event API creates one initial `pending` job atomically with each accepted event. There is no
-public API for creating, reading, or modifying jobs. An internal synchronous application service
-can claim due jobs, but no worker, polling loop, automatic claim invocation, automatic delivery
-execution, completion handling, retry rescheduling, or replay is implemented.
+public API for creating, reading, or modifying jobs. An internal claim service can change due
+`pending` jobs to `processing`. A separate internal `execute_webhook_delivery_job` completion
+service can accept a previously committed `processing` job, perform one delivery attempt, apply a
+retry decision, and flush a `succeeded`, `pending`, or `dead_letter` transition in a caller-owned
+completion transaction. A retryable `pending` transition includes its `next_attempt_at`.
+
+No worker, polling loop, automatic claim invocation, or automatic completion invocation exists.
+A scheduled `pending` retry is not executed automatically, and stale `processing` recovery and
+replay are not implemented.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -180,10 +186,13 @@ execution, completion handling, retry rescheduling, or replay is implemented.
 - `succeeded` is terminal and requires `next_attempt_at` to be `NULL`.
 - `dead_letter` is terminal and requires `next_attempt_at` to be `NULL`.
 
-The database does not enforce a complete state machine. An application service implements the
-specific `pending` to `processing` claim transition, while all other transitions and the worker
-lifecycle remain unimplemented. No worker exists, and `next_attempt_at` is not polled or executed
-automatically.
+The database does not enforce a complete state machine or transition order. The claim service
+implements `pending` to `processing`. The completion service implements `processing` to
+`succeeded`, `processing` to `pending` with a retry `next_attempt_at`, and `processing` to
+`dead_letter`. Both services flush within their separate caller-owned transactions; the caller
+decides whether to commit or roll back each transaction. Schema constraints continue to enforce
+the allowed statuses and the required nullability of `next_attempt_at`. The worker lifecycle
+remains unimplemented, and `next_attempt_at` is not polled or executed automatically.
 
 ### webhook_delivery_attempts
 

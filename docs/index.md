@@ -1,8 +1,9 @@
 # Documentation
 
-This documentation covers local development, PostgreSQL persistence, atomic event and initial
-delivery job creation, delivery job claiming, webhook delivery execution, and the currently
-available HTTP API for Reliable Webhook Delivery Service.
+This documentation covers local development, PostgreSQL persistence, atomic event and initial job
+creation, delivery job claiming, manual webhook execution, internal atomic attempt-plus-job
+completion, retry scheduling and terminal transitions, and the currently available HTTP API for
+Reliable Webhook Delivery Service.
 
 ## Start here
 
@@ -19,10 +20,10 @@ Read the documentation in this order:
 - [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
   migrations, atomic event and job transactions, the current schema, and delivery job claiming
   with `SKIP LOCKED`.
-- [Webhook delivery execution](delivery-execution.md) — public manual execution, retry decisions,
-  delivery job claiming infrastructure, and caller-owned transaction semantics in which the
-  execution service flushes an attempt and the manual route commits it, without combined job
-  completion.
+- [Webhook delivery execution](delivery-execution.md) — manual execution,
+  `execute_webhook_delivery_job`, caller-owned completion transactions, `succeeded`, `pending`, and
+  `dead_letter` transitions, separate claim and completion transactions, and the absence of a
+  worker.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
@@ -51,6 +52,8 @@ Read the documentation in this order:
 - [Review SKIP LOCKED concurrency semantics](database.md#postgresql-locking)
 - [Review delivery execution flow](delivery-execution.md#current-execution-model)
 - [Review delivery transaction ownership](delivery-execution.md#transaction-ownership)
+- [Review atomic delivery job completion](delivery-execution.md#delivery-job-completion)
+- [Review claim and completion transaction boundaries](delivery-execution.md#delivery-job-claiming)
 - [Review delivery result classification](delivery-execution.md#result-classification)
 - [Review attempt numbering](delivery-execution.md#attempt-numbering)
 - [Review delivery limitations](delivery-execution.md#current-limitations)
