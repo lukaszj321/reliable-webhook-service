@@ -76,7 +76,7 @@ python -m reliable_webhook_service.worker
 ```
 
 The CLI creates `Settings` once, then owns a local engine, a local session factory, one shared raw
-HTTP client wrapped by `HttpxWebhookHttpClient`, and one shutdown `threading.Event`. It registers
+HTTP client wrapped by `Httpx2WebhookHttpClient`, and one shutdown `threading.Event`. It registers
 handlers for `SIGINT` and, where available, `SIGTERM`. Each handler only sets the Event. The CLI
 invokes the worker loop once; importing the module does not start it.
 
