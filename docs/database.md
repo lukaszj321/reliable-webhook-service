@@ -415,9 +415,10 @@ PostgreSQL continues to manage the job's `created_at` and `updated_at` server de
 
 HTTP 201 creation and HTTP 200 equivalent reuse return the same public `WebhookEvent` shape:
 `id`, `endpoint_id`, `event_type`, `payload`, and `created_at`. It does not expose the
-idempotency key, a `created` flag, the job, a job ID, job status, or `next_attempt_at`. No public
-delivery-job API exists, and creating the durable job does not execute delivery, create an
-attempt, invoke claiming, apply retry policy, or invoke the bounded worker iteration.
+idempotency key, a `created` flag, the job, a job ID, job status, or `next_attempt_at`. The separate
+delivery-job GET API can inspect committed job state, but creating the durable job does not execute
+delivery, create an attempt, invoke claiming, apply retry policy, or invoke the bounded worker
+iteration.
 
 ## Delivery job claiming
 
@@ -482,7 +483,7 @@ recovery session closes. An explicitly started long-running worker repeats that 
 - A retryable `pending` schedule is executed only while the worker is running or by another
   explicit caller.
 - No lease timestamp, lease owner, heartbeat, or distributed coordination exists.
-- No public delivery job API exists.
+- The public delivery job API is read-only and does not control the worker lifecycle.
 
 ## Stale processing job recovery
 

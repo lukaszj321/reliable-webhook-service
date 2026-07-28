@@ -2,7 +2,7 @@
 
 A FastAPI service being developed toward reliable webhook ingestion and delivery.
 
-[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [Delivery execution](docs/delivery-execution.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
+[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [Delivery execution](docs/delivery-execution.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery jobs](docs/api/webhook-delivery-jobs.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
 
 ## Table of contents
 
@@ -161,7 +161,7 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
 - The bounded worker iteration remains a one-shot internal service even when repeated by the
-  long-running worker loop; no public delivery-job or worker-lifecycle API exists
+  long-running worker loop; delivery-job inspection is read-only and no worker-lifecycle API exists
 
 ## Planned scope
 
@@ -497,6 +497,8 @@ worker-level retry; normal shutdown exits with code `0`.
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
 | POST | `/webhook-events` | Create an event and pending job, optionally reusing an equivalent event through `Idempotency-Key` (`201`, `200`, `409`, or `422`) |
+| GET | `/webhook-events/{event_id}/delivery-job` | Inspect the delivery job for one event |
+| GET | `/webhook-delivery-jobs` | List delivery jobs with status filtering and cursor pagination |
 | POST | `/webhook-events/{event_id}/replay` | Reschedule an existing terminal job with a fresh automatic retry budget (`202`, `404`, or `409`) |
 | POST | `/webhook-events/{event_id}/delivery-attempts` | Manually execute one synchronous delivery and return the persisted attempt |
 | GET | `/webhook-events/{event_id}/delivery-attempts` | List stored completed delivery attempts for one event |
@@ -562,4 +564,5 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
+| [Webhook delivery job API](docs/api/webhook-delivery-jobs.md) | Read-only job status inspection, filtering, ordering, and cursor pagination |
 | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md) | Manual execution POST, persisted outcomes, preparation errors, and read-only GET listing |
