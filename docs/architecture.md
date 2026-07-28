@@ -1,14 +1,20 @@
 # Architecture
 
-This document is the technical overview of the Reliable Webhook Delivery Service. Start here to
-understand process boundaries, durable state, delivery semantics, and where each behavior lives in
-the codebase.
+Reliable delivery in this project is a sequence of short PostgreSQL transactions
+around an HTTP call that cannot participate in those transactions. The diagrams
+below show where state is owned, when it becomes durable, and which guarantees
+stop at the process or network boundary.
 
-## Table of contents
+## Contents
 
 - [System context](#system-context)
-- [Event ingestion and idempotency](#event-ingestion-and-idempotency)
-- [Worker delivery and retry](#worker-delivery-and-retry)
+- [Application component map](#application-component-map)
+- [Persistent data model](#persistent-data-model)
+- [Event ingestion and idempotency race](#event-ingestion-and-idempotency-race)
+- [Worker process lifecycle](#worker-process-lifecycle)
+- [Worker loop and one iteration](#worker-loop-and-one-iteration)
+- [Claim and per-job completion transactions](#claim-and-per-job-completion-transactions)
+- [Delivery and retry state machine](#delivery-and-retry-state-machine)
 - [Stale-processing recovery](#stale-processing-recovery)
 - [Manual delivery and replay](#manual-delivery-and-replay)
 - [Inspection and operations](#inspection-and-operations)
@@ -17,273 +23,498 @@ the codebase.
 - [Source map](#source-map)
 - [Navigation](#navigation)
 
-Arrows in the diagrams show control flow or durable state flow. A database arrow does not imply
-that the surrounding operations share one transaction; the text below each diagram states the
-actual boundary.
-
 ---
 
 ## System context
 
+The API accepts configuration and events, while a separate worker performs
+delivery. PostgreSQL is the hand-off point between those processes and the
+durable record of every accepted event, queued job, and completed attempt.
+
 ```mermaid
 flowchart LR
-    Client["API client"] --> API["FastAPI API process"]
-    Operator["Operator"] --> API
-    API --> PostgreSQL["PostgreSQL"]
-    PostgreSQL --> Worker["Worker process"]
-    Worker --> PostgreSQL
-    Worker --> Target["Target webhook"]
+    Client["Webhook producer"] -->|"configure endpoints<br/>ingest events"| API["FastAPI API process"]
+    Operator["Operator"] -->|"inspect, deliver manually,<br/>or replay"| API
+    API -->|"durable writes and reads"| DB[("PostgreSQL")]
+    DB -->|"due delivery jobs"| Worker["Separately started<br/>worker process"]
+    Worker -->|"HTTP request"| Target["Target endpoint"]
+    Worker -->|"attempt and job updates"| DB
 ```
 
-The API and worker are separate processes connected through durable PostgreSQL state. FastAPI
-startup does not start the worker; an operator starts each process explicitly. The worker reads due
-jobs and persists attempts and job transitions. PostgreSQL readiness does not check the target
-webhook or worker process.
+The target can observe a request before the worker commits its result. This is
+why the service records at-least-once delivery history rather than claiming
+exactly-once delivery.
 
-[Back to table of contents](#table-of-contents)
+Relevant entry points are
+[`main.py`](../src/reliable_webhook_service/main.py) and
+[`worker.py`](../src/reliable_webhook_service/worker.py).
 
 ---
 
-## Event ingestion and idempotency
+## Application component map
+
+Both processes share settings, SQLAlchemy models, database primitives, and the
+delivery services. Process entry points own long-lived resources; routes and
+service functions receive the resources they use.
+
+```mermaid
+flowchart TB
+    Settings["Settings"] --> API["FastAPI lifespan"]
+    Settings --> Worker["Worker entry point"]
+
+    subgraph APIProcess["API process"]
+        API --> Routers["API routers"]
+        API --> APISessions["Dependency-owned<br/>SQLAlchemy sessions"]
+    end
+
+    subgraph WorkerProcess["Worker process"]
+        Worker --> Orchestration["Worker orchestration"]
+        Worker --> WorkerSessions["Worker-local<br/>session factory"]
+        Orchestration --> Retry["Retry policy"]
+        Orchestration --> Services
+    end
+
+    Routers --> Services["Application services"]
+    Routers --> APISessions
+    Services --> HTTP["HTTP client abstraction"]
+    Services --> Models["SQLAlchemy models"]
+    APISessions --> PostgreSQL[("PostgreSQL")]
+    WorkerSessions --> PostgreSQL
+```
+
+The API lifespan creates one raw HTTP client for manual delivery requests, and
+the service layer wraps it behind the same abstraction used by the worker.
+The worker creates its own engine, session factory, shutdown event, and HTTP
+client, then closes or disposes all of them during process cleanup. ORM models
+describe persisted state; sessions, rather than model objects, communicate with
+PostgreSQL. The code behind these boundaries lives in
+[`dependencies.py`](../src/reliable_webhook_service/dependencies.py),
+[`database.py`](../src/reliable_webhook_service/database.py), and
+[`delivery_http.py`](../src/reliable_webhook_service/delivery_http.py).
+
+---
+
+## Persistent data model
+
+The schema keeps delivery scheduling and delivery history separate. A job is
+mutable scheduling state for one event; attempts are an append-only history of
+completed delivery calls.
+
+```mermaid
+erDiagram
+    WEBHOOK_ENDPOINT ||--o{ WEBHOOK_EVENT : owns
+    WEBHOOK_EVENT ||--|| WEBHOOK_DELIVERY_JOB : schedules
+    WEBHOOK_EVENT ||--o{ WEBHOOK_DELIVERY_ATTEMPT : records
+
+    WEBHOOK_ENDPOINT {
+        uuid id PK
+        string name
+        string target_url
+        boolean is_active
+    }
+
+    WEBHOOK_EVENT {
+        uuid id PK
+        uuid endpoint_id FK
+        string event_type
+        jsonb payload
+        string idempotency_key
+    }
+
+    WEBHOOK_DELIVERY_JOB {
+        uuid id PK
+        uuid event_id FK,UK
+        string status
+        integer attempt_count
+        timestamptz next_attempt_at
+        timestamptz updated_at
+    }
+
+    WEBHOOK_DELIVERY_ATTEMPT {
+        uuid id PK
+        uuid event_id FK
+        integer attempt_number
+        string status
+        integer response_status_code
+        text error_message
+    }
+```
+
+Important constraints are:
+
+- `(endpoint_id, idempotency_key)` is unique for keyed events;
+- `event_id` is unique in `webhook_delivery_jobs`, so an event has one current
+  job;
+- `(event_id, attempt_number)` is unique in the attempt history;
+- job status, non-negative cycle attempt count, and attempt result fields are
+  constrained in PostgreSQL.
+
+These are database relationships, not ORM object relationships. The model does
+not use `relationship()` collections. See
+[`models.py`](../src/reliable_webhook_service/models.py) and the
+[database schema](database.md#database-schema) guide for the executable model
+and migration definitions.
+
+[Back to contents](#contents)
+
+---
+
+## Event ingestion and idempotency race
+
+Event ingestion creates the event and its initial pending job in one
+caller-owned transaction. A key is scoped to an endpoint, and equivalent use of
+the same key returns the existing event.
 
 ```mermaid
 flowchart TD
-    Request["POST /webhook-events"] --> Validate["Validate endpoint and request"]
-    Validate --> Lookup["Optional scoped key lookup"]
-    Lookup -->|"equivalent"| Reuse["Return existing event"]
-    Lookup -->|"conflict"| Conflict["HTTP 409"]
-    Lookup -->|"new"| Persist["Add event and pending job"]
-    Persist --> Constraint["Unique endpoint_id + idempotency_key"]
-    Constraint --> Commit["One outer commit"]
+    Request["POST event"] --> Validate["Validate and normalize input"]
+    Validate --> Endpoint["Load active endpoint"]
+    Endpoint --> Existing{"Scoped key already exists?"}
+
+    Existing -->|"equivalent event"| Reuse["Return existing event"]
+    Existing -->|"different event"| Conflict["Return conflict"]
+    Existing -->|"no key"| Unkeyed["Add event and pending job"]
+    Existing -->|"new key"| Savepoint["Begin nested transaction<br/>(savepoint)"]
+
+    Savepoint -->|"flush event and job"| Unique["PostgreSQL unique constraint"]
+    Unique -->|"insert wins"| Commit["Route commits outer transaction"]
+    Unique -->|"concurrent insert wins"| Resolve["Roll back savepoint<br/>and re-read scoped key"]
+    Resolve -->|"equivalent"| Reuse
+    Resolve -->|"different"| Conflict
+    Unkeyed --> Commit
+    Reuse --> Commit
 ```
 
-The optional idempotency key is scoped by `(endpoint_id, idempotency_key)`. Equivalent reuse returns
-the existing event; reuse with different event content is a conflict. A PostgreSQL unique
-constraint is the concurrency authority when requests race.
+Only the expected uniqueness violation is treated as an idempotency race.
+Other integrity errors still propagate. The nested transaction protects the
+outer request transaction so the winner can be re-read without discarding
+unrelated caller-owned work. Ingestion does not perform target HTTP.
 
-For a new request, the event and initial `pending` delivery job are persisted atomically by one
-outer transaction. The request does not perform downstream HTTP. See
-[Database and migrations](database.md#atomic-event-and-delivery-job-creation) and
-[Webhook event API](api/webhook-events.md).
-
-Sources:
-
-- [API routes](../src/reliable_webhook_service/api.py)
-- [Event ingestion service](../src/reliable_webhook_service/event_service.py)
-- [Database models](../src/reliable_webhook_service/models.py)
-
-[Back to table of contents](#table-of-contents)
+Implementation: [`event_service.py`](../src/reliable_webhook_service/event_service.py)
+and [`api.py`](../src/reliable_webhook_service/api.py).
 
 ---
 
-## Worker delivery and retry
+## Worker process lifecycle
+
+The worker entry point owns resources that must live for the whole process. It
+installs signal handlers around the loop and cleans up even when an ordinary
+fatal error escapes.
 
 ```mermaid
-flowchart LR
-    Due["Due pending job"] --> Claim["Claim transaction"]
-    Claim --> Processing["processing"]
-    Processing --> HTTP["External HTTP"]
-    HTTP --> Attempt["Persist completed attempt"]
-    Attempt --> Decision["Deterministic retry decision"]
-    Decision --> Succeeded["succeeded"]
-    Decision --> Pending["pending with next_attempt_at"]
-    Decision --> Dead["dead_letter"]
+flowchart TD
+    CLI["python -m reliable_webhook_service.worker"] --> Settings["Load settings once"]
+    Settings --> Engine["Create worker-local engine"]
+    Engine --> SessionFactory["Create worker-local<br/>session factory"]
+    Settings --> HTTP["Create shared HTTP client"]
+    Settings --> Signals["Install SIGINT and available<br/>SIGTERM handlers"]
+    Signals --> StopEvent["Threading shutdown event"]
+    SessionFactory --> Loop["Run worker loop"]
+    HTTP --> Loop
+    StopEvent --> Loop
+    Loop -->|"shutdown requested"| Cleanup["Close HTTP context,<br/>restore handlers, dispose engine"]
+    Loop -->|"ordinary fatal error"| Cleanup
+    Cleanup -->|"normal shutdown"| Exit0["Exit code 0"]
+    Cleanup -->|"fatal error"| Exit1["Exit code 1"]
 ```
 
-The claim query uses PostgreSQL `FOR UPDATE SKIP LOCKED` with deterministic ordering. Its commit
-finishes before external HTTP begins. The processing cycle then opens one completion transaction
-per claimed job.
+`SIGINT` is always handled. `SIGTERM` is registered only when the platform
+exposes it. Cleanup errors are reported without replacing an already known loop
+failure. The lifecycle is implemented in
+[`worker.py`](../src/reliable_webhook_service/worker.py).
 
-Within a completion transaction, the new `WebhookDeliveryAttempt` and resulting delivery job
-transition are committed or rolled back together. Earlier job completions remain committed if a
-later job fails, so bounded processing intentionally permits partial progress. Retry delays are
-deterministic bounded exponential backoff. Delivery is not exactly-once.
+---
 
-See [Webhook delivery execution](delivery-execution.md) and
-[Database and migrations](database.md#delivery-job-claiming).
+## Worker loop and one iteration
 
-Sources:
+The first iteration starts immediately. A single UTC timestamp anchors recovery
+and claiming, which prevents time from drifting between the two phases of the
+same iteration.
 
-- [Job claiming](../src/reliable_webhook_service/delivery_job_service.py)
-- [Bounded processing cycle](../src/reliable_webhook_service/delivery_processing_service.py)
-- [Job completion](../src/reliable_webhook_service/delivery_job_execution_service.py)
-- [Delivery execution](../src/reliable_webhook_service/delivery_service.py)
-- [Retry policy](../src/reliable_webhook_service/retry_policy.py)
-- [Worker iteration](../src/reliable_webhook_service/worker_iteration_service.py)
-- [Worker loop](../src/reliable_webhook_service/worker_loop_service.py)
+```mermaid
+flowchart TD
+    Start["Start loop"] --> Before{"Shutdown requested?"}
+    Before -->|"yes"| Stop["Return normally"]
+    Before -->|"no"| Time["Capture iteration_at once"]
+    Time --> Cutoff["stale_before = iteration_at<br/>- processing timeout"]
+    Cutoff --> Recovery["Open recovery session<br/>and recover stale jobs"]
+    Recovery --> RecoveryEnd["Commit or rollback,<br/>then close recovery session"]
+    RecoveryEnd --> Processing["Process one delivery cycle<br/>with claimed_at = iteration_at"]
+    Processing --> After{"Shutdown requested?"}
+    After -->|"yes"| Stop
+    After -->|"no"| Wait["Wait poll interval<br/>on shutdown event"]
+    Wait --> Before
+```
 
-[Back to table of contents](#table-of-contents)
+Recovery must commit and close before claiming begins. If recovery fails,
+processing is not attempted. A processing failure also escapes the loop; there
+is no in-process retry around a failed iteration.
+
+The loop and iteration split is visible in
+[`worker_loop_service.py`](../src/reliable_webhook_service/worker_loop_service.py)
+and
+[`worker_iteration_service.py`](../src/reliable_webhook_service/worker_iteration_service.py).
+
+[Back to contents](#contents)
+
+---
+
+## Claim and per-job completion transactions
+
+Claiming is deliberately separated from network delivery. The claim
+transaction is short and releases row locks before any request is sent.
+Each claimed UUID is then completed in its own fresh session and transaction.
+
+```mermaid
+flowchart TD
+    subgraph ClaimTx["Claim transaction"]
+        ClaimSession["Open claim session"] --> Query["Select due pending jobs<br/>FOR UPDATE SKIP LOCKED"]
+        Query --> Mark["Set status=processing<br/>and flush"]
+        Mark --> Snapshot["Snapshot ordered job UUIDs"]
+    end
+
+    Snapshot -->|"commit and close<br/>before HTTP"| Next["Take next UUID"]
+
+    subgraph CompletionTx["One completion transaction per job"]
+        Next --> CompletionSession["Open fresh completion session"]
+        CompletionSession --> Execute["Load processing job<br/>and execute delivery"]
+        Attempt["Persist delivery attempt"]
+        Attempt --> Decision["Apply retry decision using<br/>cycle attempt count"]
+        Decision --> JobState["Update job status, count,<br/>schedule, and timestamp"]
+        JobState --> Finish{"Commit succeeds?"}
+        Finish -->|"yes"| Durable["Append result and close session"]
+        Finish -->|"no"| Rollback["Rollback current job;<br/>earlier commits remain;<br/>stop cycle"]
+    end
+
+    Execute -->|"HTTP, not transactional"| Target["Target webhook"]
+    Target --> Attempt
+    Durable -->|"more claimed UUIDs"| Next
+```
+
+The claim query is bounded, deterministic, and uses `SKIP LOCKED`, so concurrent
+workers can claim different rows. Earlier per-job commits remain durable if a
+later claimed job fails. The current job's attempt and state transition roll
+back together, although the remote target may already have observed the HTTP
+request.
+
+The boundaries are enforced by
+[`delivery_processing_service.py`](../src/reliable_webhook_service/delivery_processing_service.py),
+[`delivery_job_service.py`](../src/reliable_webhook_service/delivery_job_service.py),
+and
+[`delivery_job_execution_service.py`](../src/reliable_webhook_service/delivery_job_execution_service.py).
+
+---
+
+## Delivery and retry state machine
+
+A delivery job moves through four states. The worker claims only due `pending`
+jobs. Delivery success is any HTTP 2xx response; other completed calls are
+failed attempts evaluated by the retry policy.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: event accepted
+    pending --> processing: worker / due claim
+    processing --> succeeded: worker / HTTP 2xx
+    processing --> pending: worker / failed below limit, set next_attempt_at
+    processing --> dead_letter: worker / retry budget exhausted
+    processing --> pending: recovery / stale processing job
+    succeeded --> pending: replay / schedule existing job
+    dead_letter --> pending: replay / schedule existing job
+```
+
+`WebhookDeliveryAttempt.attempt_number` is global across the event's entire
+history. `WebhookDeliveryJob.attempt_count` counts automatic worker attempts in
+the current retry cycle. Manual delivery can advance the global number without
+advancing the cycle count; replay resets the cycle count to zero.
+
+For a failed worker call, the retry decision receives
+`job.attempt_count + 1`. Backoff is deterministic, exponential, and bounded.
+The relevant code is
+[`delivery_service.py`](../src/reliable_webhook_service/delivery_service.py),
+[`delivery_job_execution_service.py`](../src/reliable_webhook_service/delivery_job_execution_service.py),
+and [`retry_policy.py`](../src/reliable_webhook_service/retry_policy.py).
 
 ---
 
 ## Stale-processing recovery
 
+A worker can disappear after committing a claim. Recovery makes such jobs
+eligible again without inventing a delivery attempt.
+
 ```mermaid
 flowchart LR
-    Stale["processing with updated_at <= stale_before"] --> Recovery["Recovery claim"]
-    Recovery --> Pending["pending"]
-    Pending --> Schedule["next_attempt_at = recovered_at"]
-    Schedule --> Cycle["Normal processing cycle"]
+    Processing["processing jobs"] --> Scan["Bounded deterministic scan"]
+    Cutoff["updated_at <= stale_before"] --> Scan
+    Scan -->|"SELECT ...<br/>FOR UPDATE SKIP LOCKED"| Lock["Lock eligible rows"]
+    Lock -->|"processing to pending"| Reset["Set status=pending"]
+    Reset --> Schedule["next_attempt_at = recovered_at<br/>updated_at = recovered_at"]
+    Schedule -->|"flush"| Flush["Persist recovered rows"]
+    Flush -->|"commit"| Commit["Close recovery session"]
+    Commit --> Due["Eligible for the processing phase<br/>of the same iteration"]
 ```
 
-Recovery eligibility is inclusive: production recovery selects `processing` jobs with
-`updated_at <= stale_before`. This differs intentionally from the operational summary's exclusive
-stale count boundary.
+The recovery boundary is inclusive (`updated_at <= stale_before`). The
+operational stale count uses an exclusive boundary (`updated_at <
+stale_processing_before`), so it is a monitoring snapshot rather than the
+recovery query itself. Recovery does not call the target, create an attempt, or
+change the current cycle attempt count.
 
-One worker iteration commits its bounded recovery transaction before starting the separate
-processing cycle. A recovered job is scheduled at `recovered_at` and can therefore be eligible in
-the same iteration. Recovery creates no delivery attempt and performs no HTTP.
+Code: [`delivery_job_recovery_service.py`](../src/reliable_webhook_service/delivery_job_recovery_service.py).
 
-See [Stale processing job recovery](delivery-execution.md#stale-processing-job-recovery) and
-[Database recovery semantics](database.md#stale-processing-job-recovery).
-
-Source: [Recovery service](../src/reliable_webhook_service/delivery_job_recovery_service.py).
-
-[Back to table of contents](#table-of-contents)
+[Back to contents](#contents)
 
 ---
 
 ## Manual delivery and replay
 
+Manual delivery and replay are separate operations. One performs HTTP now and
+adds to history; the other only resets terminal scheduling state for the worker.
+
 ```mermaid
-flowchart TD
-    Manual["POST delivery-attempts"] --> ManualHTTP["HTTP inside request"]
-    ManualHTTP --> GlobalAttempt["New event-wide attempt"]
-    GlobalAttempt --> Unchanged["Delivery job unchanged"]
-    Replay["POST replay"] --> Lock["Lock existing terminal job"]
-    Lock --> Reset["pending; attempt_count = 0"]
-    Reset --> Later["Worker delivers later"]
+flowchart LR
+    subgraph Manual["Manual delivery"]
+        ManualRequest["Manual delivery request"] --> ManualChecks["Load event and<br/>active endpoint"]
+        ManualChecks --> ManualHTTP["One target HTTP request"]
+        ManualHTTP --> ManualAttempt["Append global attempt"]
+        ManualAttempt --> Unchanged["Delivery job unchanged"]
+    end
+
+    subgraph Replay["Replay"]
+        ReplayRequest["Replay request"] --> ReplayLock["Lock existing job"]
+        ReplayLock --> Terminal{"succeeded or dead_letter?"}
+        Terminal -->|"yes"| Reset["Set pending, schedule now,<br/>attempt_count=0"]
+        Reset --> Later["Worker delivers later"]
+        Terminal -->|"no"| Reject["Reject replay"]
+    end
 ```
 
-Synchronous manual delivery and asynchronous terminal replay are different operations. Manual
-delivery performs HTTP during the API request and appends a globally numbered attempt without
-changing the delivery job. `WebhookDeliveryAttempt.attempt_number` remains monotonic across the
-event's complete history.
+Both operations use caller-owned database transactions. Manual delivery can
+succeed or fail independently of the delivery job state. Replay creates neither
+an HTTP request nor an attempt; it reuses the one existing job for the event.
+Use manual delivery when the request must happen synchronously, and replay when
+the worker should own a new automatic retry cycle.
 
-Replay performs no HTTP and creates no attempt. It locks the existing `succeeded` or `dead_letter`
-job, resets `WebhookDeliveryJob.attempt_count` for the new automatic retry cycle, and schedules the
-worker to deliver later. Replay is not ingestion idempotency and can produce duplicate downstream
-side effects when an earlier remote outcome was uncertain.
-
-See [Webhook event replay](api/webhook-events.md#manual-replay),
-[Webhook delivery attempt API](api/webhook-delivery-attempts.md), and
-[Delivery execution](delivery-execution.md#manual-replay-and-retry-cycle-budget).
-
-Sources:
-
-- [Replay service](../src/reliable_webhook_service/replay_service.py)
-- [Delivery service](../src/reliable_webhook_service/delivery_service.py)
-
-[Back to table of contents](#table-of-contents)
+See [`delivery_service.py`](../src/reliable_webhook_service/delivery_service.py),
+[`replay_service.py`](../src/reliable_webhook_service/replay_service.py), and
+[`api.py`](../src/reliable_webhook_service/api.py).
 
 ---
 
 ## Inspection and operations
 
+Inspection endpoints read durable state without changing it. They are separate
+from the worker control path and do not contact webhook targets.
+
 ```mermaid
 flowchart LR
-    Operator["Operator"] --> Job["GET one delivery job"]
-    Operator --> Jobs["GET delivery job collection"]
-    Operator --> Health["GET /health"]
+    Operator["Operator or monitor"] --> Health["GET /health"]
+    Operator --> EventJob["Get job for event"]
+    Operator --> Collection["List jobs<br/>keyset cursor"]
     Operator --> Ready["GET /ready"]
     Operator --> Summary["GET /operations/summary"]
-    Job --> PostgreSQL["Committed PostgreSQL state"]
-    Jobs --> PostgreSQL
-    Ready --> PostgreSQL
-    Summary --> PostgreSQL
+
+    Health --> Independent["No database dependency"]
+    EventJob --> ReadOnly["Dependency-owned<br/>read-only session"]
+    Collection --> ReadOnly
+    Ready -->|"SELECT 1"| DB[("PostgreSQL")]
+    Summary -->|"one aggregate query"| DB
+    ReadOnly --> DB
 ```
 
-Job inspection is read-only, uses no row locks, and returns committed snapshots. Collection
-pagination is deterministic keyset pagination with an opaque cursor. `/health` is dependency-free
-liveness, `/ready` runs one minimal PostgreSQL query, and `/operations/summary` executes one
-conditional aggregate statement.
+Job collection order is `updated_at DESC, id DESC`; its opaque cursor carries
+that keyset boundary. The operations summary counts states and reports due and
+stale timing data from one generated timestamp. A response is a snapshot and
+can become stale immediately after it is returned. These reads do not lock job
+rows, start a worker, contact a target, or trigger recovery, delivery, or replay.
 
-These GET endpoints do not start the worker, claim or recover jobs, replay events, or contact target
-webhooks. Results can become stale immediately after the response because concurrent transactions
-continue normally.
-
-See [Operational endpoints](operations.md) and
-[Webhook delivery job API](api/webhook-delivery-jobs.md).
-
-Sources:
-
-- [Operations API](../src/reliable_webhook_service/operations_api.py)
-- [Operations service](../src/reliable_webhook_service/operations_service.py)
-- [Job query service](../src/reliable_webhook_service/delivery_job_query_service.py)
-
-[Back to table of contents](#table-of-contents)
+Inspect
+[`delivery_job_query_service.py`](../src/reliable_webhook_service/delivery_job_query_service.py),
+[`operations_service.py`](../src/reliable_webhook_service/operations_service.py),
+and [`operations_api.py`](../src/reliable_webhook_service/operations_api.py)
+for the exact query contracts.
 
 ---
 
 ## Transaction boundaries
 
-| Flow | Transaction boundary |
-|---|---|
-| Event ingestion | Event and initial job share one API-owned outer transaction |
-| Idempotency race | A savepoint contains the keyed insert race; the outer transaction remains authoritative |
-| Job claim | One dedicated transaction commits before external HTTP |
-| Job completion | One transaction per job persists the attempt and job transition together |
-| Worker iteration | Recovery commits before processing; no iteration-wide transaction exists |
-| Manual delivery | The API commits one new attempt; the job is unchanged |
-| Replay | The API locks and reschedules the existing terminal job in one transaction |
-| Inspection and operations | Read-only dependency-owned sessions; no explicit commit or row lock |
+The session owner also owns commit and rollback. Service functions flush when
+they need database-generated state or early constraint evaluation, but they do
+not commit a caller's transaction.
 
-External HTTP cannot participate in the PostgreSQL transaction. A request may reach a target even
-when local completion later rolls back.
+| Operation | Session owner | Durable boundary |
+| --- | --- | --- |
+| Event ingestion | API dependency and route | Event and initial job commit together |
+| Manual delivery | API dependency and route | Attempt commits with the request transaction |
+| Replay | API dependency and route | Locked job reset commits with the request transaction |
+| Stale recovery | Worker iteration | Recovery batch commits before claiming starts |
+| Claim due jobs | Delivery-cycle coordinator | All selected jobs become `processing` in one short transaction |
+| Complete one claimed job | Delivery-cycle coordinator | Attempt and job transition commit together for that UUID |
+| Inspection and operations | API dependency | Read-only transaction ends when the dependency closes |
 
-[Back to table of contents](#table-of-contents)
+`get_session()` rolls back exceptions propagated by routes. Worker coordinators
+explicitly commit, roll back, and close their worker-local sessions. No
+transaction spans both claiming and outbound HTTP.
 
 ---
 
 ## Guarantees and limitations
 
-- PostgreSQL is the durability and concurrency authority for local event, job, and attempt state.
-- Event ingestion with a new request atomically persists the event and its initial job.
-- Completed worker attempts and their corresponding job transitions are atomic locally.
-- Delivery is effectively at-least-once; uncertain external outcomes can be delivered again.
-- Downstream systems should implement idempotency or deduplication.
-- The service has no built-in authentication or authorization.
-- There is no distributed worker coordination, lease ownership, or worker heartbeat.
-- Operational responses are point-in-time observations, not durable scheduling decisions.
+What the design guarantees:
 
-[Back to table of contents](#table-of-contents)
+- accepted events and their initial jobs are created atomically;
+- a keyed event is idempotent within its endpoint, including the expected
+  concurrent insert race;
+- job claiming is bounded and safe for concurrent workers through row locks and
+  `SKIP LOCKED`;
+- a completed worker attempt and its job transition share one transaction;
+- stale claims can return to the pending queue;
+- retry scheduling is deterministic from the worker cycle attempt number;
+- persisted attempts retain event-wide chronological numbering.
+
+What it intentionally does not guarantee:
+
+- exactly-once delivery to an external target;
+- rollback of a request already observed by the target;
+- proof that a stale job did not reach the target before its worker disappeared;
+  recovery can therefore cause a duplicate downstream delivery;
+- exactly-once recovery through replay; replay schedules another worker cycle;
+- successful continuation after an iteration-level worker failure;
+- automatic process supervision or restart;
+- outbound request cancellation merely because a shutdown signal arrived;
+- delivery ordering across different events or workers;
+- a durable transaction that also covers remote side effects; PostgreSQL
+  coordinates local state only.
+
+The practical duplicate window is between the target observing an HTTP request
+and PostgreSQL committing the corresponding attempt. Target systems should
+therefore treat webhook consumption as idempotent.
 
 ---
 
 ## Source map
 
-| Area | Source |
-|---|---|
-| Application setup | [main.py](../src/reliable_webhook_service/main.py) |
-| API routes | [api.py](../src/reliable_webhook_service/api.py) |
-| Event ingestion | [event_service.py](../src/reliable_webhook_service/event_service.py) |
-| Delivery execution | [delivery_service.py](../src/reliable_webhook_service/delivery_service.py) |
-| Job claiming | [delivery_job_service.py](../src/reliable_webhook_service/delivery_job_service.py) |
-| Bounded processing | [delivery_processing_service.py](../src/reliable_webhook_service/delivery_processing_service.py) |
-| Job completion | [delivery_job_execution_service.py](../src/reliable_webhook_service/delivery_job_execution_service.py) |
-| Retry policy | [retry_policy.py](../src/reliable_webhook_service/retry_policy.py) |
-| Recovery | [delivery_job_recovery_service.py](../src/reliable_webhook_service/delivery_job_recovery_service.py) |
-| Worker iteration | [worker_iteration_service.py](../src/reliable_webhook_service/worker_iteration_service.py) |
-| Worker loop | [worker_loop_service.py](../src/reliable_webhook_service/worker_loop_service.py) |
-| Worker process | [worker.py](../src/reliable_webhook_service/worker.py) |
-| Replay | [replay_service.py](../src/reliable_webhook_service/replay_service.py) |
-| Inspection | [delivery_job_query_service.py](../src/reliable_webhook_service/delivery_job_query_service.py) |
-| Operations | [operations_service.py](../src/reliable_webhook_service/operations_service.py) |
-| Database models | [models.py](../src/reliable_webhook_service/models.py) |
-| Schemas | [schemas.py](../src/reliable_webhook_service/schemas.py) |
-| Configuration | [config.py](../src/reliable_webhook_service/config.py) |
+Use this map to move from a diagram to the implementation:
 
-[Back to table of contents](#table-of-contents)
+| Concern | Primary modules |
+| --- | --- |
+| API composition and resource lifetime | [`main.py`](../src/reliable_webhook_service/main.py), [`dependencies.py`](../src/reliable_webhook_service/dependencies.py) |
+| Configuration and database primitives | [`config.py`](../src/reliable_webhook_service/config.py), [`database.py`](../src/reliable_webhook_service/database.py) |
+| Persistent model | [`models.py`](../src/reliable_webhook_service/models.py), [database schema](database.md#database-schema) |
+| Event ingestion | [`api.py`](../src/reliable_webhook_service/api.py), [`event_service.py`](../src/reliable_webhook_service/event_service.py) |
+| Delivery and retry | [`delivery_service.py`](../src/reliable_webhook_service/delivery_service.py), [`delivery_job_execution_service.py`](../src/reliable_webhook_service/delivery_job_execution_service.py), [`retry_policy.py`](../src/reliable_webhook_service/retry_policy.py) |
+| Worker lifecycle and loop | [`worker.py`](../src/reliable_webhook_service/worker.py), [`worker_loop_service.py`](../src/reliable_webhook_service/worker_loop_service.py), [`worker_iteration_service.py`](../src/reliable_webhook_service/worker_iteration_service.py) |
+| Claiming and completion | [`delivery_job_service.py`](../src/reliable_webhook_service/delivery_job_service.py), [`delivery_processing_service.py`](../src/reliable_webhook_service/delivery_processing_service.py) |
+| Recovery | [`delivery_job_recovery_service.py`](../src/reliable_webhook_service/delivery_job_recovery_service.py) |
+| Manual delivery and replay | [`api.py`](../src/reliable_webhook_service/api.py), [`delivery_service.py`](../src/reliable_webhook_service/delivery_service.py), [`replay_service.py`](../src/reliable_webhook_service/replay_service.py) |
+| Inspection and operations | [`delivery_job_query_service.py`](../src/reliable_webhook_service/delivery_job_query_service.py), [`operations_service.py`](../src/reliable_webhook_service/operations_service.py), [`operations_api.py`](../src/reliable_webhook_service/operations_api.py) |
 
 ---
 
 ## Navigation
 
 - [Documentation portal](index.md)
-- [Development setup](development.md)
-- [Database and migrations](database.md)
-- [Webhook delivery execution](delivery-execution.md)
-- [Operational endpoints](operations.md)
 - [API documentation](api/index.md)
-- [Changelog](../CHANGELOG.md)
+- [Database and migrations](database.md)
+- [Development setup](development.md)
 - [Project README](../README.md)
