@@ -5,6 +5,7 @@ This documentation describes the HTTP endpoints currently available in the FastA
 ## Available API areas
 
 - Health check
+- [Operational health and queue summary](../operations.md)
 - [Webhook endpoint configuration](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
 - Manual webhook replay through the [Webhook event API](webhook-events.md#manual-replay)
@@ -24,6 +25,17 @@ The health check returns HTTP 200 and can be used to confirm that the applicatio
   "status": "ok"
 }
 ```
+
+## Operational endpoints
+
+Available routes:
+
+- `GET /health` checks application liveness without resolving dependencies.
+- `GET /ready` checks PostgreSQL readiness.
+- `GET /operations/summary` returns safe aggregate delivery job statistics.
+
+See [Operational endpoints](../operations.md) for response contracts, status codes, queue
+boundaries, snapshot semantics, and deployment guidance.
 
 ## Webhook endpoint configuration
 
@@ -93,6 +105,7 @@ FastAPI exposes interactive API documentation when the application is running lo
 - [Webhook event API](webhook-events.md)
 - [Webhook delivery job API](webhook-delivery-jobs.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
+- [Operational endpoints](../operations.md)
 - [Documentation index](../index.md)
 - [Development setup](../development.md)
 - [Project README](../../README.md)

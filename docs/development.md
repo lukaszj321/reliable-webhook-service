@@ -177,8 +177,10 @@ with code `1`. Failure logging must not expose payloads, secrets, or full respon
 
 The health endpoint is:
 
-```text
-GET /health
+```powershell
+curl.exe http://localhost:8000/health
+curl.exe http://localhost:8000/ready
+curl.exe http://localhost:8000/operations/summary
 ```
 
 Interactive Swagger UI is available at:
@@ -186,6 +188,8 @@ Interactive Swagger UI is available at:
 ```text
 http://127.0.0.1:8000/docs
 ```
+
+See [Operational endpoints](operations.md) for liveness, readiness, and queue summary semantics.
 
 ## Quality checks
 
