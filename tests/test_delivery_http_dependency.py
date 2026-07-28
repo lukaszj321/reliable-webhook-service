@@ -137,13 +137,17 @@ def test_health_and_business_routes_match_current_contract(
             ("GET", "/health"),
             ("GET", "/webhook-endpoints"),
             ("POST", "/webhook-endpoints"),
+            ("GET", "/webhook-delivery-jobs"),
             ("POST", "/webhook-events"),
+            ("GET", "/webhook-events/{event_id}/delivery-job"),
             ("GET", "/webhook-events/{event_id}/delivery-attempts"),
             ("POST", "/webhook-events/{event_id}/delivery-attempts"),
             ("POST", "/webhook-events/{event_id}/replay"),
         ]
     )
     assert business_routes.count(("GET", "/webhook-events/{event_id}/delivery-attempts")) == 1
+    assert business_routes.count(("GET", "/webhook-events/{event_id}/delivery-job")) == 1
+    assert business_routes.count(("GET", "/webhook-delivery-jobs")) == 1
     assert business_routes.count(("POST", "/webhook-events/{event_id}/delivery-attempts")) == 1
     assert business_routes.count(("POST", "/webhook-events/{event_id}/replay")) == 1
     assert business_routes.count(("POST", "/webhook-delivery-attempts")) == 0
