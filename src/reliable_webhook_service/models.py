@@ -53,6 +53,13 @@ class WebhookEndpoint(Base):
 
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "endpoint_id",
+            "idempotency_key",
+            name="uq_webhook_events_endpoint_id_idempotency_key",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -68,6 +75,7 @@ class WebhookEvent(Base):
     )
     event_type: Mapped[str] = mapped_column(String(255), nullable=False)
     payload: Mapped[dict[str, JsonValue]] = mapped_column(JSONB, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
