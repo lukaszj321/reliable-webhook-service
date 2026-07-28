@@ -69,6 +69,13 @@ class WebhookEventResponse(BaseModel):
     created_at: datetime
 
 
+class WebhookReplayResponse(BaseModel):
+    event_id: uuid.UUID
+    delivery_job_id: uuid.UUID
+    status: Literal["pending"]
+    next_attempt_at: AwareDatetime
+
+
 class WebhookDeliveryAttemptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
