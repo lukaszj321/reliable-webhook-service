@@ -6,6 +6,7 @@ from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
+    Field,
     HttpUrl,
     StringConstraints,
     UrlConstraints,
@@ -96,6 +97,32 @@ class WebhookDeliveryJobResponse(BaseModel):
 class WebhookDeliveryJobListResponse(BaseModel):
     items: list[WebhookDeliveryJobResponse]
     next_cursor: str | None
+
+
+class ReadinessChecksResponse(BaseModel):
+    database: Literal["ok", "unavailable"]
+
+
+class ReadinessResponse(BaseModel):
+    status: Literal["ready", "not_ready"]
+    checks: ReadinessChecksResponse
+
+
+class WebhookDeliveryJobOperationalCountsResponse(BaseModel):
+    pending: int = Field(ge=0)
+    processing: int = Field(ge=0)
+    succeeded: int = Field(ge=0)
+    dead_letter: int = Field(ge=0)
+    due_pending: int = Field(ge=0)
+    stale_processing: int = Field(ge=0)
+
+
+class WebhookOperationalSummaryResponse(BaseModel):
+    generated_at: AwareDatetime
+    delivery_jobs: WebhookDeliveryJobOperationalCountsResponse
+    oldest_due_pending_at: AwareDatetime | None
+    oldest_processing_updated_at: AwareDatetime | None
+    stale_processing_before: AwareDatetime
 
 
 class WebhookDeliveryAttemptResponse(BaseModel):

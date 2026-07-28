@@ -12,6 +12,7 @@ from reliable_webhook_service.api import (
     webhook_event_router,
 )
 from reliable_webhook_service.delivery_http import Httpx2WebhookHttpClient
+from reliable_webhook_service.operations_api import router as operations_router
 
 
 @asynccontextmanager
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     application.include_router(webhook_endpoint_router)
     application.include_router(webhook_event_router)
     application.include_router(webhook_delivery_job_router)
+    application.include_router(operations_router)
     application.add_api_route("/health", health, methods=["GET"])
     return application
 

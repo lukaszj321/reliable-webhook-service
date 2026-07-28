@@ -135,6 +135,8 @@ def test_health_and_business_routes_match_current_contract(
     assert business_routes == sorted(
         [
             ("GET", "/health"),
+            ("GET", "/operations/summary"),
+            ("GET", "/ready"),
             ("GET", "/webhook-endpoints"),
             ("POST", "/webhook-endpoints"),
             ("GET", "/webhook-delivery-jobs"),
