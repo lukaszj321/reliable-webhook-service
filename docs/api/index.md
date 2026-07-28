@@ -8,6 +8,7 @@ This documentation describes the HTTP endpoints currently available in the FastA
 - [Webhook endpoint configuration](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
 - Manual webhook replay through the [Webhook event API](webhook-events.md#manual-replay)
+- [Webhook delivery job API](webhook-delivery-jobs.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
 
 ## Health check
@@ -70,6 +71,15 @@ manual delivery automatically.
 See [Webhook delivery attempt API](webhook-delivery-attempts.md) for response fields, ordering,
 manual execution behavior, outcomes, empty results, and errors.
 
+## Webhook delivery job API
+
+`GET /webhook-events/{event_id}/delivery-job` returns the current operational job snapshot for one
+event. `GET /webhook-delivery-jobs` lists jobs with an optional status filter, bounded limit, and
+opaque cursor pagination.
+
+See [Webhook delivery job API](webhook-delivery-jobs.md) for response fields, status meanings,
+ordering, pagination, read-only semantics, and replay race behavior.
+
 ## Interactive documentation
 
 FastAPI exposes interactive API documentation when the application is running locally:
@@ -81,6 +91,7 @@ FastAPI exposes interactive API documentation when the application is running lo
 
 - [Webhook endpoint API](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
+- [Webhook delivery job API](webhook-delivery-jobs.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
 - [Documentation index](../index.md)
 - [Development setup](../development.md)

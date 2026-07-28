@@ -8,6 +8,7 @@ from reliable_webhook_service.api import (
     router as webhook_endpoint_router,
 )
 from reliable_webhook_service.api import (
+    webhook_delivery_job_router,
     webhook_event_router,
 )
 from reliable_webhook_service.delivery_http import Httpx2WebhookHttpClient
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     )
     application.include_router(webhook_endpoint_router)
     application.include_router(webhook_event_router)
+    application.include_router(webhook_delivery_job_router)
     application.add_api_route("/health", health, methods=["GET"])
     return application
 

@@ -883,6 +883,10 @@ local timeout or transaction failure. It does not provide exactly-once delivery;
 replay deliberately, and downstream systems should implement idempotency or deduplication when
 required.
 
+Current job state can be observed through the read-only delivery job API. Its GET operations do
+not lock, claim, recover, or replay jobs, and the returned snapshot can become stale immediately
+when a worker or replay transaction changes the row.
+
 ## Error handling
 
 ### Manual route errors
@@ -977,7 +981,6 @@ lifecycle endpoint.
 - No request signing
 - No custom headers
 - No response body persistence
-- No public delivery-job API
 
 Retry scheduling exists when internal completion is invoked: a retryable failed attempt changes
 its job from `processing` to `pending` with the policy's `next_attempt_at`. An explicitly running
@@ -991,4 +994,5 @@ the same iteration.
 - [Database and migrations](database.md)
 - [API documentation](api/index.md)
 - [Webhook event API](api/webhook-events.md)
+- [Webhook delivery job API](api/webhook-delivery-jobs.md)
 - [Webhook delivery attempt API](api/webhook-delivery-attempts.md)

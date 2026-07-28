@@ -297,10 +297,15 @@ Authentication and authorization are not implemented. Production deployments sho
 restrict replay to authorized operators. The replay response contains no payload, idempotency key,
 stored response body, or authorization data; replay paths should not log payloads.
 
+Use the read-only
+[event-scoped delivery job endpoint](webhook-delivery-jobs.md#event-scoped-inspection) to inspect
+the current job before or after replay. A GET snapshot does not lock the job and may become stale
+before a later replay request.
+
 ## Non-goals and current limitations
 
-- General event listing through `GET /webhook-events` is not available. The only read operation
-  nested under an event is the delivery attempt listing for one existing event.
+- General event listing through `GET /webhook-events` is not available. Event-scoped reads expose
+  the delivery job and completed delivery attempts for one existing event.
 - `POST /webhook-events` stores the event and pending job but does not start delivery or invoke
   `POST /webhook-events/{event_id}/delivery-attempts`.
 - One synchronous delivery can be started explicitly through
@@ -333,6 +338,7 @@ stored response body, or authorization data; replay paths should not log payload
 ## Navigation
 
 - [API documentation index](index.md)
+- [Webhook delivery job API](webhook-delivery-jobs.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
 - [Webhook delivery execution](../delivery-execution.md)
 - [Main documentation index](../index.md)

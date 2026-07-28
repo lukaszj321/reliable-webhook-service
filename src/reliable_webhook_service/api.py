@@ -2,11 +2,23 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import get_session
+from reliable_webhook_service.delivery_job_query_service import (
+    DEFAULT_WEBHOOK_DELIVERY_JOB_LIST_LIMIT,
+    MAX_WEBHOOK_DELIVERY_JOB_LIST_LIMIT,
+    WebhookDeliveryJobCursorValidationError,
+    WebhookDeliveryJobEventNotFoundError,
+    WebhookDeliveryJobLimitValidationError,
+    WebhookDeliveryJobNotFoundError,
+    WebhookDeliveryJobStatus,
+    WebhookDeliveryJobStatusValidationError,
+    get_webhook_delivery_job,
+    list_webhook_delivery_jobs,
+)
 from reliable_webhook_service.delivery_service import (
     InactiveWebhookEndpointError,
     WebhookEndpointNotFoundError,
@@ -40,6 +52,8 @@ from reliable_webhook_service.replay_service import (
 )
 from reliable_webhook_service.schemas import (
     WebhookDeliveryAttemptResponse,
+    WebhookDeliveryJobListResponse,
+    WebhookDeliveryJobResponse,
     WebhookEndpointCreate,
     WebhookEndpointResponse,
     WebhookEventCreate,
@@ -49,6 +63,15 @@ from reliable_webhook_service.schemas import (
 
 SessionDependency = Annotated[Session, Depends(get_session)]
 IdempotencyKeyHeader = Annotated[str | None, Header(alias="Idempotency-Key")]
+DeliveryJobStatusQuery = Annotated[
+    WebhookDeliveryJobStatus | None,
+    Query(alias="status"),
+]
+DeliveryJobLimitQuery = Annotated[
+    int,
+    Query(ge=1, le=MAX_WEBHOOK_DELIVERY_JOB_LIST_LIMIT),
+]
+DeliveryJobCursorQuery = Annotated[str | None, Query()]
 
 router = APIRouter(
     prefix="/webhook-endpoints",
@@ -58,6 +81,11 @@ router = APIRouter(
 webhook_event_router = APIRouter(
     prefix="/webhook-events",
     tags=["webhook-events"],
+)
+
+webhook_delivery_job_router = APIRouter(
+    prefix="/webhook-delivery-jobs",
+    tags=["webhook-delivery-jobs"],
 )
 
 
@@ -177,6 +205,68 @@ def list_webhook_delivery_attempts(
         )
     )
     return list(session.scalars(statement).all())
+
+
+@webhook_event_router.get(
+    "/{event_id}/delivery-job",
+    response_model=WebhookDeliveryJobResponse,
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "Webhook event not found"},
+        status.HTTP_409_CONFLICT: {"description": "Webhook delivery job not found"},
+    },
+)
+def get_webhook_delivery_job_route(
+    event_id: uuid.UUID,
+    session: SessionDependency,
+) -> WebhookDeliveryJobResponse:
+    try:
+        result = get_webhook_delivery_job(session, event_id=event_id)
+    except WebhookDeliveryJobEventNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except WebhookDeliveryJobNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+    return WebhookDeliveryJobResponse.model_validate(result)
+
+
+@webhook_delivery_job_router.get(
+    "",
+    response_model=WebhookDeliveryJobListResponse,
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"description": "Invalid status, limit, or cursor"},
+    },
+)
+def list_webhook_delivery_jobs_route(
+    session: SessionDependency,
+    job_status: DeliveryJobStatusQuery = None,
+    limit: DeliveryJobLimitQuery = DEFAULT_WEBHOOK_DELIVERY_JOB_LIST_LIMIT,
+    cursor: DeliveryJobCursorQuery = None,
+) -> WebhookDeliveryJobListResponse:
+    try:
+        page = list_webhook_delivery_jobs(
+            session,
+            status=job_status,
+            limit=limit,
+            cursor=cursor,
+        )
+    except (
+        WebhookDeliveryJobStatusValidationError,
+        WebhookDeliveryJobLimitValidationError,
+        WebhookDeliveryJobCursorValidationError,
+    ) as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        ) from error
+    return WebhookDeliveryJobListResponse(
+        items=[WebhookDeliveryJobResponse.model_validate(item) for item in page.items],
+        next_cursor=page.next_cursor,
+    )
 
 
 @webhook_event_router.post(

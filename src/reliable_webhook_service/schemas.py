@@ -76,6 +76,28 @@ class WebhookReplayResponse(BaseModel):
     next_attempt_at: AwareDatetime
 
 
+class WebhookDeliveryJobResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    event_id: uuid.UUID
+    status: Literal[
+        "pending",
+        "processing",
+        "succeeded",
+        "dead_letter",
+    ]
+    attempt_count: int
+    next_attempt_at: AwareDatetime | None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+
+class WebhookDeliveryJobListResponse(BaseModel):
+    items: list[WebhookDeliveryJobResponse]
+    next_cursor: str | None
+
+
 class WebhookDeliveryAttemptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

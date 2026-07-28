@@ -40,14 +40,16 @@ Read the documentation in this order:
   [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), which performs
   recovery-before-processing with independent limits and separate transactions. Partial progress
   and the duplicate remote delivery risk after an uncertain earlier HTTP result remain.
-- [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
-  attempt APIs.
+- [API documentation](api/index.md) — health check, webhook endpoint, webhook event, delivery job,
+  and delivery attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
   listing behavior.
 - [Webhook event API](api/webhook-events.md) — optional endpoint-scoped `Idempotency-Key`, event
   validation, `201` creation, `200` equivalent reuse, conflict handling, atomic event and pending
   job persistence, the unchanged event-only response, and asynchronous terminal-job
   [manual replay](api/webhook-events.md#manual-replay).
+- [Webhook delivery job API](api/webhook-delivery-jobs.md) — read-only operational status
+  inspection, status filtering, deterministic ordering, and keyset pagination.
 - [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`,
   including the manual route commit and unchanged completed-attempt response, plus read-only
   listing with `GET`, outcomes, ordering, and error responses.
@@ -90,6 +92,8 @@ Read the documentation in this order:
 - [Review webhook event status and error behavior](api/webhook-events.md#validation-and-error-responses)
 - [Review webhook event persistence behavior](api/webhook-events.md#persistence-behavior)
 - [Replay a terminal webhook event](api/webhook-events.md#manual-replay)
+- [Inspect delivery job status](api/webhook-delivery-jobs.md#event-scoped-inspection)
+- [List and filter delivery jobs](api/webhook-delivery-jobs.md#collection-inspection)
 - [Review idempotency persistence and concurrency](database.md#atomic-event-and-delivery-job-creation)
 - [Manually execute one webhook delivery](api/webhook-delivery-attempts.md#manual-delivery-endpoint)
 - [List delivery attempts](api/webhook-delivery-attempts.md#listing-endpoint)
