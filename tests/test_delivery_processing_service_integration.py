@@ -155,6 +155,7 @@ def _persist_job(
     created_at: datetime,
     updated_at: datetime,
     is_active: bool = True,
+    attempt_count: int = 0,
 ) -> _PersistedJob:
     endpoint_id = uuid.uuid4()
     event_id = uuid.uuid4()
@@ -193,6 +194,7 @@ def _persist_job(
                 event_id=event_id,
                 status="pending",
                 next_attempt_at=next_attempt_at,
+                attempt_count=attempt_count,
                 created_at=created_at,
                 updated_at=updated_at,
             )
@@ -384,6 +386,7 @@ def test_processing_cycle_commits_ordered_success_retry_and_dead_letter_results(
                 next_attempt_at=base_time + timedelta(seconds=index),
                 created_at=base_time - timedelta(minutes=1),
                 updated_at=base_time - timedelta(seconds=30),
+                attempt_count=2 if label == "dead-letter" else 0,
             )
             for index, label in enumerate(("succeeded", "retryable", "dead-letter"))
         ]
@@ -464,6 +467,7 @@ def test_processing_cycle_commits_ordered_success_retry_and_dead_letter_results(
                 "pending",
                 "dead_letter",
             ]
+            assert [job.attempt_count for job in stored_jobs] == [1, 1, 3]
             assert stored_jobs[0].next_attempt_at is None
             assert stored_jobs[1].next_attempt_at is not None
             assert _as_utc(stored_jobs[1].next_attempt_at) == expected_retry_at

@@ -536,6 +536,7 @@ def test_webhook_delivery_job_migration() -> None:
             "next_attempt_at",
             "created_at",
             "updated_at",
+            "attempt_count",
         ]
         columns_by_name = {column["name"]: column for column in columns}
 
@@ -575,6 +576,11 @@ def test_webhook_delivery_job_migration() -> None:
         assert updated_at_column["default"] is not None
         assert "now()" in str(updated_at_column["default"]).lower()
 
+        attempt_count_column = columns_by_name["attempt_count"]
+        assert isinstance(attempt_count_column["type"], Integer)
+        assert attempt_count_column["nullable"] is False
+        assert attempt_count_column["default"] == "0"
+
         primary_key = inspector.get_pk_constraint("webhook_delivery_jobs")
         assert primary_key["constrained_columns"] == ["id"]
 
@@ -602,9 +608,15 @@ def test_webhook_delivery_job_migration() -> None:
             for constraint in check_constraints
         }
         assert set(normalized_checks) == {
+            "ck_webhook_delivery_jobs_attempt_count_non_negative",
             "ck_webhook_delivery_jobs_status",
             "ck_webhook_delivery_jobs_status_next_attempt_at",
         }
+
+        attempt_count_check = normalized_checks[
+            "ck_webhook_delivery_jobs_attempt_count_non_negative"
+        ]
+        assert attempt_count_check == "attempt_count >= 0"
 
         status_check = normalized_checks["ck_webhook_delivery_jobs_status"]
         assert "status" in status_check
@@ -634,6 +646,75 @@ def test_webhook_delivery_job_migration() -> None:
             if index.get("duplicates_constraint") != "uq_webhook_delivery_jobs_event_id"
         ]
         assert unexpected_indexes == []
+
+        command.downgrade(alembic_config, "9970fa5ecbab")
+
+        attempt_count_downgraded_inspector = inspect(engine)
+        assert attempt_count_downgraded_inspector.has_table("webhook_delivery_jobs") is True
+        assert [
+            column["name"]
+            for column in attempt_count_downgraded_inspector.get_columns("webhook_delivery_jobs")
+        ] == [
+            "id",
+            "event_id",
+            "status",
+            "next_attempt_at",
+            "created_at",
+            "updated_at",
+        ]
+        assert attempt_count_downgraded_inspector.get_pk_constraint("webhook_delivery_jobs")[
+            "constrained_columns"
+        ] == ["id"]
+
+        downgraded_foreign_keys = attempt_count_downgraded_inspector.get_foreign_keys(
+            "webhook_delivery_jobs"
+        )
+        assert len(downgraded_foreign_keys) == 1
+        assert downgraded_foreign_keys[0]["constrained_columns"] == ["event_id"]
+        assert downgraded_foreign_keys[0]["referred_table"] == "webhook_events"
+        assert downgraded_foreign_keys[0]["referred_columns"] == ["id"]
+        assert downgraded_foreign_keys[0]["options"].get("ondelete") == "CASCADE"
+
+        downgraded_unique_constraints = attempt_count_downgraded_inspector.get_unique_constraints(
+            "webhook_delivery_jobs"
+        )
+        assert [
+            constraint
+            for constraint in downgraded_unique_constraints
+            if constraint["name"] == "uq_webhook_delivery_jobs_event_id"
+            and constraint["column_names"] == ["event_id"]
+        ]
+
+        downgraded_check_constraints = {
+            constraint["name"]: " ".join(str(constraint["sqltext"]).lower().split())
+            for constraint in attempt_count_downgraded_inspector.get_check_constraints(
+                "webhook_delivery_jobs"
+            )
+        }
+        assert set(downgraded_check_constraints) == {
+            "ck_webhook_delivery_jobs_status",
+            "ck_webhook_delivery_jobs_status_next_attempt_at",
+        }
+
+        command.upgrade(alembic_config, "head")
+
+        attempt_count_restored_inspector = inspect(engine)
+        assert "attempt_count" in {
+            column["name"]
+            for column in attempt_count_restored_inspector.get_columns("webhook_delivery_jobs")
+        }
+        assert (
+            len(
+                [
+                    constraint
+                    for constraint in attempt_count_restored_inspector.get_check_constraints(
+                        "webhook_delivery_jobs"
+                    )
+                    if constraint["name"] == "ck_webhook_delivery_jobs_attempt_count_non_negative"
+                ]
+            )
+            == 1
+        )
 
         command.downgrade(alembic_config, "10f4dd620e97")
 

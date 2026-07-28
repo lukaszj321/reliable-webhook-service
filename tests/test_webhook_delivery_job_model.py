@@ -3,7 +3,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import CheckConstraint, DateTime, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 
 from reliable_webhook_service.models import WebhookDeliveryJob
@@ -18,6 +18,7 @@ def test_delivery_job_table_has_expected_columns() -> None:
         "event_id",
         "status",
         "next_attempt_at",
+        "attempt_count",
         "created_at",
         "updated_at",
     }
@@ -111,6 +112,26 @@ def test_delivery_job_status_controls_next_attempt_at_nullability() -> None:
         "succeeded",
         "dead_letter",
     }
+
+
+def test_delivery_job_attempt_count_is_non_negative() -> None:
+    attempt_count_column = WebhookDeliveryJob.__table__.c.attempt_count
+    constraint = next(
+        item
+        for item in WebhookDeliveryJob.__table__.constraints
+        if item.name == "ck_webhook_delivery_jobs_attempt_count_non_negative"
+    )
+
+    assert isinstance(attempt_count_column.type, Integer)
+    assert attempt_count_column.nullable is False
+    assert attempt_count_column.default is not None
+    assert attempt_count_column.default.arg == 0
+    assert attempt_count_column.server_default is not None
+    assert str(attempt_count_column.server_default.arg) == "0"
+    assert isinstance(constraint, CheckConstraint)
+
+    sql = " ".join(str(constraint.sqltext).lower().split())
+    assert sql == "attempt_count >= 0"
 
 
 def test_delivery_job_timestamps_have_server_defaults_without_updates() -> None:

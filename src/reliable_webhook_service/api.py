@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
@@ -29,12 +30,21 @@ from reliable_webhook_service.models import (
     WebhookEndpoint,
     WebhookEvent,
 )
+from reliable_webhook_service.replay_service import (
+    WebhookReplayDeliveryJobNotFoundError,
+    WebhookReplayDeliveryJobNotReplayableError,
+    WebhookReplayEndpointInactiveError,
+    WebhookReplayEndpointNotFoundError,
+    WebhookReplayEventNotFoundError,
+    replay_webhook_event,
+)
 from reliable_webhook_service.schemas import (
     WebhookDeliveryAttemptResponse,
     WebhookEndpointCreate,
     WebhookEndpointResponse,
     WebhookEventCreate,
     WebhookEventResponse,
+    WebhookReplayResponse,
 )
 
 SessionDependency = Annotated[Session, Depends(get_session)]
@@ -49,6 +59,10 @@ webhook_event_router = APIRouter(
     prefix="/webhook-events",
     tags=["webhook-events"],
 )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 @router.post(
@@ -163,6 +177,47 @@ def list_webhook_delivery_attempts(
         )
     )
     return list(session.scalars(statement).all())
+
+
+@webhook_event_router.post(
+    "/{event_id}/replay",
+    response_model=WebhookReplayResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def replay_webhook_event_route(
+    event_id: uuid.UUID,
+    session: SessionDependency,
+) -> WebhookReplayResponse:
+    replayed_at = _utc_now()
+    try:
+        result = replay_webhook_event(
+            session,
+            event_id=event_id,
+            replayed_at=replayed_at,
+        )
+    except WebhookReplayEventNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(error),
+        ) from error
+    except (
+        WebhookReplayEndpointNotFoundError,
+        WebhookReplayEndpointInactiveError,
+        WebhookReplayDeliveryJobNotFoundError,
+        WebhookReplayDeliveryJobNotReplayableError,
+    ) as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+
+    session.commit()
+    return WebhookReplayResponse(
+        event_id=result.event_id,
+        delivery_job_id=result.delivery_job_id,
+        status="pending",
+        next_attempt_at=result.next_attempt_at,
+    )
 
 
 @webhook_event_router.post(

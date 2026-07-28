@@ -57,6 +57,7 @@ def execute_webhook_delivery_job(
     if job.status != "processing":
         raise WebhookDeliveryJobNotProcessingError("Webhook delivery job is not processing")
 
+    cycle_attempt_number = job.attempt_count + 1
     attempt = execute_webhook_delivery(
         session,
         event_id=job.event_id,
@@ -68,7 +69,7 @@ def execute_webhook_delivery_job(
     decision_at = decision_now()
     decision: RetryDecision = decide_webhook_retry(
         outcome=attempt.outcome,
-        attempt_number=attempt.attempt_number,
+        attempt_number=cycle_attempt_number,
         decision_at=decision_at,
         max_attempts=max_attempts,
         base_delay_seconds=base_delay_seconds,
@@ -76,6 +77,7 @@ def execute_webhook_delivery_job(
     )
     normalized_decision_at = decision_at.astimezone(UTC)
 
+    job.attempt_count = cycle_attempt_number
     job.status = decision.status
     job.next_attempt_at = decision.next_attempt_at
     job.updated_at = normalized_decision_at

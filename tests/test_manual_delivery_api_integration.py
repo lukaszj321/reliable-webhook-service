@@ -2,7 +2,7 @@ import json
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 
 import httpx2
 import pytest
@@ -12,6 +12,9 @@ from sqlalchemy import func, select
 from reliable_webhook_service.config import Settings
 from reliable_webhook_service.database import SessionFactory
 from reliable_webhook_service.delivery_http import Httpx2WebhookHttpClient
+from reliable_webhook_service.delivery_job_execution_service import (
+    execute_webhook_delivery_job,
+)
 from reliable_webhook_service.dependencies import (
     get_settings,
     get_webhook_http_client,
@@ -20,6 +23,7 @@ from reliable_webhook_service.main import create_app
 from reliable_webhook_service.models import (
     JsonValue,
     WebhookDeliveryAttempt,
+    WebhookDeliveryJob,
     WebhookEndpoint,
     WebhookEvent,
 )
@@ -90,6 +94,23 @@ def _persist_attempt(
                 response_status_code=200,
                 error_message=None,
                 duration_ms=1,
+            )
+        )
+        session.commit()
+
+
+def _persist_processing_job(
+    *,
+    job_id: uuid.UUID,
+    event_id: uuid.UUID,
+) -> None:
+    with SessionFactory() as session:
+        session.add(
+            WebhookDeliveryJob(
+                id=job_id,
+                event_id=event_id,
+                status="processing",
+                next_attempt_at=datetime(2026, 7, 28, 8, 0, tzinfo=UTC),
             )
         )
         session.commit()
@@ -219,6 +240,7 @@ def test_successful_delivery_persists_and_lists_attempt() -> None:
     marker = uuid.uuid4()
     endpoint_id = uuid.uuid4()
     event_id = uuid.uuid4()
+    job_id = uuid.uuid4()
     target_url = f"https://example.test/manual-delivery/{marker}?tenant=alpha"
     payload: dict[str, JsonValue] = {
         "event": "order.created",
@@ -247,6 +269,7 @@ def test_successful_delivery_persists_and_lists_attempt() -> None:
             target_url=target_url,
             payload=payload,
         )
+        _persist_processing_job(job_id=job_id, event_id=event_id)
         endpoint_before = _endpoint_snapshot(endpoint_id)
         event_before = _event_snapshot(event_id)
 
@@ -294,9 +317,83 @@ def test_successful_delivery_persists_and_lists_attempt() -> None:
         assert stored_attempt.attempted_at == attempted_at
         assert _endpoint_snapshot(endpoint_id) == endpoint_before
         assert _event_snapshot(event_id) == event_before
+        with SessionFactory() as session:
+            stored_job = session.get(WebhookDeliveryJob, job_id)
+            assert stored_job is not None
+            assert stored_job.status == "processing"
+            assert stored_job.attempt_count == 0
 
         assert listing_response.status_code == 200
         assert listing_response.json() == [response_body]
+    finally:
+        _cleanup_records(
+            event_ids=[event_id],
+            endpoint_ids=[endpoint_id],
+        )
+
+
+def test_worker_attempt_after_manual_delivery_uses_first_cycle_attempt() -> None:
+    marker = uuid.uuid4()
+    endpoint_id = uuid.uuid4()
+    event_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    target_url = f"https://example.test/manual-delivery/{marker}/then-worker"
+    payload: dict[str, JsonValue] = {"marker": str(marker)}
+    requests: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(204)
+
+    try:
+        _persist_endpoint_and_event(
+            endpoint_id=endpoint_id,
+            event_id=event_id,
+            marker=marker,
+            target_url=target_url,
+            payload=payload,
+        )
+        _persist_processing_job(job_id=job_id, event_id=event_id)
+
+        with _application_client(handler) as client:
+            manual_response = client.post(f"/webhook-events/{event_id}/delivery-attempts")
+
+        assert manual_response.status_code == 201
+        assert manual_response.json()["attempt_number"] == 1
+        with SessionFactory() as verification_session:
+            job_after_manual_delivery = verification_session.get(WebhookDeliveryJob, job_id)
+            assert job_after_manual_delivery is not None
+            assert job_after_manual_delivery.attempt_count == 0
+            assert job_after_manual_delivery.status == "processing"
+
+        with httpx2.Client(transport=httpx2.MockTransport(handler)) as raw_client:
+            worker_client = Httpx2WebhookHttpClient(raw_client)
+            with SessionFactory() as worker_session:
+                worker_result = execute_webhook_delivery_job(
+                    worker_session,
+                    job_id=job_id,
+                    http_client=worker_client,
+                    timeout_seconds=2.5,
+                    max_attempts=3,
+                    base_delay_seconds=5.0,
+                    max_delay_seconds=300.0,
+                    utc_now=lambda: datetime(2026, 7, 28, 8, 1, tzinfo=UTC),
+                    decision_now=lambda: datetime(2026, 7, 28, 8, 2, tzinfo=UTC),
+                    monotonic_ns=iter([1_000_000_000, 1_010_000_000]).__next__,
+                )
+                assert worker_result.attempt.attempt_number == 2
+                assert worker_result.job.attempt_count == 1
+                assert worker_result.job.status == "succeeded"
+                worker_session.commit()
+
+        attempts = _attempts_for_event(event_id)
+        assert [attempt.attempt_number for attempt in attempts] == [1, 2]
+        with SessionFactory() as verification_session:
+            stored_job = verification_session.get(WebhookDeliveryJob, job_id)
+            assert stored_job is not None
+            assert stored_job.attempt_count == 1
+            assert stored_job.status == "succeeded"
+        assert len(requests) == 2
     finally:
         _cleanup_records(
             event_ids=[event_id],

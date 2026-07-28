@@ -76,6 +76,7 @@ def _create_webhook_event_with_delivery_job(
         event_id=event.id,
         status="pending",
         next_attempt_at=event.created_at,
+        attempt_count=0,
     )
     session.add(job)
     session.flush()

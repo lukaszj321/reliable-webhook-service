@@ -7,6 +7,7 @@ This documentation describes the HTTP endpoints currently available in the FastA
 - Health check
 - [Webhook endpoint configuration](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
+- Manual webhook replay through the [Webhook event API](webhook-events.md#manual-replay)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
 
 ## Health check
@@ -46,6 +47,11 @@ not execute synchronous delivery.
 
 See [Webhook event API](webhook-events.md) for request, response, validation, persistence, and error
 details.
+
+The same API area exposes `POST /webhook-events/{event_id}/replay`. It accepts no body, returns
+HTTP 202, and moves an existing `succeeded` or `dead_letter` job to `pending` with a fresh worker
+retry-cycle budget. Replay performs no downstream HTTP; missing events return 404, while endpoint,
+job, and active-state conflicts return 409.
 
 ## Webhook delivery attempt API
 
