@@ -19,7 +19,8 @@ Read the documentation in this order:
 1. [Development setup](development.md)
 2. [Database and migrations](database.md)
 3. [Webhook delivery execution](delivery-execution.md)
-4. [API documentation](api/index.md)
+4. [Operational endpoints](operations.md)
+5. [API documentation](api/index.md)
 
 ## Documentation map
 
@@ -40,6 +41,8 @@ Read the documentation in this order:
   [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), which performs
   recovery-before-processing with independent limits and separate transactions. Partial progress
   and the duplicate remote delivery risk after an uncertain earlier HTTP result remain.
+- [Operational endpoints](operations.md) — liveness, PostgreSQL readiness, safe aggregate delivery
+  queue statistics, and deployment probe guidance.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, delivery job,
   and delivery attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
@@ -83,6 +86,7 @@ Read the documentation in this order:
 - [Review delivery result classification](delivery-execution.md#result-classification)
 - [Review attempt numbering](delivery-execution.md#attempt-numbering)
 - [Review delivery limitations](delivery-execution.md#current-limitations)
+- [Inspect operational health and queue state](operations.md)
 - [Review available API endpoints](api/index.md#available-api-areas)
 - [Create a webhook endpoint](api/webhook-endpoints.md#create-a-webhook-endpoint)
 - [List webhook endpoints](api/webhook-endpoints.md#list-webhook-endpoints)

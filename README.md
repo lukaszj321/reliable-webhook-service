@@ -2,7 +2,7 @@
 
 A FastAPI service being developed toward reliable webhook ingestion and delivery.
 
-[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [Delivery execution](docs/delivery-execution.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery jobs](docs/api/webhook-delivery-jobs.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
+[Documentation](docs/index.md) | [Development](docs/development.md) | [Database](docs/database.md) | [Delivery execution](docs/delivery-execution.md) | [Operations](docs/operations.md) | [API](docs/api/index.md) | [Webhook endpoints](docs/api/webhook-endpoints.md) | [Webhook events](docs/api/webhook-events.md) | [Delivery jobs](docs/api/webhook-delivery-jobs.md) | [Delivery attempts](docs/api/webhook-delivery-attempts.md)
 
 ## Table of contents
 
@@ -494,6 +494,8 @@ worker-level retry; normal shutdown exits with code `0`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Check application availability |
+| GET | `/ready` | Check PostgreSQL readiness |
+| GET | `/operations/summary` | Inspect aggregate delivery queue state |
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
 | POST | `/webhook-events` | Create an event and pending job, optionally reusing an equivalent event through `Idempotency-Key` (`201`, `200`, `409`, or `422`) |
@@ -561,6 +563,7 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, worker startup, and quality checks |
 | [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, worker resource ownership, claiming, recovery, bounded worker-iteration orchestration, and `SKIP LOCKED` transaction semantics |
 | [Webhook delivery execution](docs/delivery-execution.md) | The [long-running worker process](docs/delivery-execution.md#long-running-worker-process), manual execution, the [bounded worker iteration](docs/delivery-execution.md#bounded-worker-iteration), polling, graceful shutdown, recovery and processing, partial progress, duplicate-delivery risk, and transaction boundaries |
+| [Operational endpoints](docs/operations.md) | Liveness, PostgreSQL readiness, safe queue summary, and deployment probe guidance |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |
