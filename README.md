@@ -27,6 +27,14 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - `POST /webhook-endpoints` and `GET /webhook-endpoints`
 - `POST /webhook-events` validates a webhook event and atomically creates one `WebhookEvent` and
   one associated `pending` `WebhookDeliveryJob` in a caller-owned transaction
+- `POST /webhook-events` accepts an optional endpoint-scoped `Idempotency-Key` header. A new
+  request returns HTTP 201; an equivalent keyed retry returns the existing event with HTTP 200;
+  conflicting reuse returns HTTP 409; and an invalid key returns HTTP 422
+- Event-ingestion idempotency uses the unique `(endpoint_id, idempotency_key)` scope, a
+  PostgreSQL-backed race safeguard, and atomic event-plus-job creation. The public response remains
+  event-only and does not expose the key or an internal `created` flag
+- Event-ingestion idempotency does not provide downstream delivery idempotency or exactly-once
+  delivery; the service does not forward `Idempotency-Key` to the target
 - The route commits the event and job together once; `next_attempt_at` represents the same instant
   as the server-generated `event.created_at`
 - PostgreSQL JSONB event persistence linked to an existing `WebhookEndpoint`; inactive endpoints
@@ -161,7 +169,8 @@ The following capabilities are planned but are not currently implemented:
 - Parallel delivery completion
 - Configurable worker-level retry after a fatal iteration failure
 - Remote delivery verification
-- Idempotency keys
+- Downstream delivery idempotency and remote-side deduplication
+- Idempotency-key expiration, deletion, or automatic cleanup
 - Exactly-once delivery
 - Direct delivery execution inside the event-creation API request
 - Manual replay
@@ -185,14 +194,20 @@ flowchart LR
     Router --> Session["SQLAlchemy session"]
     Session --> Endpoint["WebhookEndpoint"]
     Endpoint --> PostgreSQL["PostgreSQL"]
-    App --> EventAPI["FastAPI<br/>POST /webhook-events"]
+    App --> EventAPI["FastAPI<br/>POST /webhook-events<br/>optional Idempotency-Key"]
     EventAPI -->|"validates request"| EventValidation["Pydantic validation"]
-    EventValidation --> EventService["create_webhook_event_with_delivery_job"]
-    EventService -->|"caller-owned transaction"| EventSession["SQLAlchemy session"]
+    EventValidation --> EventService["create_idempotent_webhook_event_with_delivery_job"]
+    EventService -->|"pre-insert scoped lookup"| ExistingKey{"Existing scoped key?"}
+    ExistingKey -->|"equivalent"| ReusedEvent["Existing event response<br/>200 OK"]
+    ExistingKey -->|"different event type or payload"| EventConflict["409 Conflict"]
+    ExistingKey -->|"new key or no key"| EventSession["SQLAlchemy session<br/>caller-owned outer transaction"]
     EventSession -->|"add + flush"| Event["WebhookEvent"]
     Event -->|"event.id + event.created_at"| Job["WebhookDeliveryJob<br/>pending"]
     EventSession -->|"add + flush"| Job
-    EventAPI -->|"one commit after both flushes"| EventSession
+    EventSession -->|"keyed insert savepoint"| EventKeyConstraint["PostgreSQL unique constraint<br/>(endpoint_id, idempotency_key)<br/>race safeguard"]
+    EventKeyConstraint --> PostgreSQL
+    EventAPI -->|"one outer commit after both flushes"| EventSession
+    EventSession -->|"new event response"| CreatedEvent["201 Created"]
     Event --> PostgreSQL
     Job --> PostgreSQL
     App --> AttemptPOST["FastAPI<br/>POST /webhook-events/{event_id}/delivery-attempts"]
@@ -368,8 +383,8 @@ invokes recovery before processing in every later iteration.
 The external HTTP request is not part of the PostgreSQL transaction. A rollback cannot undo an
 HTTP request that already reached the target. If that request succeeded remotely but completion
 was not committed, recovery followed by a later processing cycle can send the webhook again.
-Recovery performs no remote verification and creates no missing attempt, so idempotency and
-exactly-once delivery are not guaranteed. Detailed behavior is documented in [Database and
+Recovery performs no remote verification and creates no missing attempt, so downstream delivery
+idempotency and exactly-once delivery are not guaranteed. Detailed behavior is documented in [Database and
 migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
 documentation](docs/api/index.md).
 
@@ -464,13 +479,16 @@ worker-level retry; normal shutdown exits with code `0`.
 | GET | `/health` | Check application availability |
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
-| POST | `/webhook-events` | Store an event and atomically create its pending delivery job |
+| POST | `/webhook-events` | Create an event and pending job, optionally reusing an equivalent event through `Idempotency-Key` (`201`, `200`, `409`, or `422`) |
 | POST | `/webhook-events/{event_id}/delivery-attempts` | Manually execute one synchronous delivery and return the persisted attempt |
 | GET | `/webhook-events/{event_id}/delivery-attempts` | List stored completed delivery attempts for one event |
 
-The pending job is a durable work item and is not included in the event response. Manual delivery
-remains explicit: `POST /webhook-events` does not invoke the delivery endpoint or execute HTTP
-inside the API request. An explicitly started worker process can later claim the due job.
+The optional `Idempotency-Key` header is endpoint-scoped. A new event returns HTTP 201, while an
+equivalent keyed retry returns the same event with HTTP 200 and creates no second job. Conflicting
+reuse returns HTTP 409, and an invalid key returns HTTP 422. Both successful statuses use the same
+event-only response schema; the key and job are not returned. Manual delivery remains explicit:
+`POST /webhook-events` does not invoke the delivery endpoint or execute HTTP inside the API
+request. An explicitly started worker process can later claim the due job.
 
 [API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md) | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md)
 

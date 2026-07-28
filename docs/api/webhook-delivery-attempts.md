@@ -250,8 +250,9 @@ An invalid UUID returns FastAPI HTTP 422 with its standard validation payload.
   processing. Recovery itself creates no delivery attempt.
 - The API process neither starts nor controls the worker process and exposes no worker start,
   stop, or status endpoint. The GET request itself invokes neither processing nor recovery.
-- Exactly-once delivery, idempotency, and replay are not provided. Duplicate remote delivery
-  remains possible when an earlier HTTP outcome is uncertain.
+- Exactly-once delivery and downstream delivery idempotency are not provided. This manual endpoint
+  is not replay, and duplicate remote delivery remains possible when an earlier HTTP outcome is
+  uncertain.
 - Pagination and filtering are not implemented for GET.
 - Authentication is not implemented.
 - A top-level `/webhook-delivery-attempts` endpoint does not exist.

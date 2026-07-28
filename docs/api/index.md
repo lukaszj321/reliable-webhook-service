@@ -36,10 +36,13 @@ See [Webhook endpoint API](webhook-endpoints.md) for request, response, and vali
 
 ## Webhook event API
 
-`POST /webhook-events` validates a webhook event request and atomically stores one `WebhookEvent`
-and one associated `pending` `WebhookDeliveryJob` in PostgreSQL. Its response still contains only
-the event. An inactive endpoint is accepted, while a request that references a missing endpoint
-returns HTTP 404 without creating either record. The route does not execute delivery.
+`POST /webhook-events` accepts an optional endpoint-scoped `Idempotency-Key` header. A new event
+and its initial `pending` `WebhookDeliveryJob` are stored atomically and return HTTP 201. An
+equivalent keyed retry reuses the event without creating another job and returns HTTP 200;
+conflicting key reuse returns HTTP 409, and an invalid key returns HTTP 422. Both successful
+statuses use the same event-only response schema and do not expose the key. An inactive endpoint
+is accepted, while a request that references a missing endpoint returns HTTP 404. The route does
+not execute synchronous delivery.
 
 See [Webhook event API](webhook-events.md) for request, response, validation, persistence, and error
 details.

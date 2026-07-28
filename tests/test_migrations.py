@@ -1,6 +1,9 @@
+import json
+import uuid
+
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import DateTime, Integer, String, Text, inspect
+from sqlalchemy import DateTime, Integer, String, Text, inspect, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from reliable_webhook_service.database import engine
@@ -55,6 +58,7 @@ def test_webhook_event_migration() -> None:
             "event_type",
             "payload",
             "created_at",
+            "idempotency_key",
         ]
         columns_by_name = {column["name"]: column for column in columns}
 
@@ -287,6 +291,228 @@ def test_webhook_delivery_attempt_migration() -> None:
     assert final_inspector.has_table("webhook_delivery_attempts") is True
     assert final_inspector.has_table("webhook_events") is True
     assert final_inspector.has_table("webhook_endpoints") is True
+
+
+def test_webhook_event_idempotency_migration() -> None:
+    alembic_config = Config("alembic.ini")
+    alembic_config.set_main_option("path_separator", "os")
+    previous_revision = "200628ca5044"
+    endpoint_id = uuid.uuid4()
+    event_id = uuid.uuid4()
+    constraint_name = "uq_webhook_events_endpoint_id_idempotency_key"
+
+    try:
+        command.downgrade(alembic_config, previous_revision)
+
+        previous_inspector = inspect(engine)
+        assert previous_inspector.has_table("webhook_endpoints") is True
+        assert previous_inspector.has_table("webhook_events") is True
+        assert previous_inspector.has_table("webhook_delivery_attempts") is True
+        assert previous_inspector.has_table("webhook_delivery_jobs") is True
+        assert [column["name"] for column in previous_inspector.get_columns("webhook_events")] == [
+            "id",
+            "endpoint_id",
+            "event_type",
+            "payload",
+            "created_at",
+        ]
+        assert all(
+            constraint["name"] != constraint_name
+            for constraint in previous_inspector.get_unique_constraints("webhook_events")
+        )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO webhook_endpoints (
+                        id,
+                        name,
+                        target_url
+                    )
+                    VALUES (
+                        :id,
+                        :name,
+                        :target_url
+                    )
+                    """
+                ),
+                {
+                    "id": endpoint_id,
+                    "name": f"Idempotency migration endpoint {endpoint_id}",
+                    "target_url": f"https://example.test/idempotency-migration/{endpoint_id}",
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO webhook_events (
+                        id,
+                        endpoint_id,
+                        event_type,
+                        payload
+                    )
+                    VALUES (
+                        :id,
+                        :endpoint_id,
+                        :event_type,
+                        CAST(:payload AS jsonb)
+                    )
+                    """
+                ),
+                {
+                    "id": event_id,
+                    "endpoint_id": endpoint_id,
+                    "event_type": "idempotency.migration",
+                    "payload": json.dumps({"marker": str(event_id)}),
+                },
+            )
+
+        command.upgrade(alembic_config, "head")
+
+        upgraded_inspector = inspect(engine)
+        columns = upgraded_inspector.get_columns("webhook_events")
+        columns_by_name = {column["name"]: column for column in columns}
+        idempotency_key_column = columns_by_name["idempotency_key"]
+        assert isinstance(idempotency_key_column["type"], String)
+        assert idempotency_key_column["type"].length == 255
+        assert idempotency_key_column["nullable"] is True
+        assert idempotency_key_column["default"] is None
+
+        unique_constraints = upgraded_inspector.get_unique_constraints("webhook_events")
+        idempotency_constraints = [
+            constraint for constraint in unique_constraints if constraint["name"] == constraint_name
+        ]
+        assert len(idempotency_constraints) == 1
+        assert idempotency_constraints[0]["column_names"] == [
+            "endpoint_id",
+            "idempotency_key",
+        ]
+
+        indexes = upgraded_inspector.get_indexes("webhook_events")
+        endpoint_id_indexes = [
+            index for index in indexes if index["name"] == "ix_webhook_events_endpoint_id"
+        ]
+        assert len(endpoint_id_indexes) == 1
+        assert endpoint_id_indexes[0]["column_names"] == ["endpoint_id"]
+        assert endpoint_id_indexes[0]["unique"] is False
+        speculative_idempotency_indexes = [
+            index
+            for index in indexes
+            if "idempotency_key" in index["column_names"]
+            and index.get("duplicates_constraint") != constraint_name
+        ]
+        assert speculative_idempotency_indexes == []
+
+        with engine.connect() as connection:
+            stored_idempotency_key = connection.scalar(
+                text(
+                    """
+                    SELECT idempotency_key
+                    FROM webhook_events
+                    WHERE id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+        assert stored_idempotency_key is None
+
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM webhook_events WHERE id = :event_id"),
+                {"event_id": event_id},
+            )
+            connection.execute(
+                text("DELETE FROM webhook_endpoints WHERE id = :endpoint_id"),
+                {"endpoint_id": endpoint_id},
+            )
+
+        command.downgrade(alembic_config, previous_revision)
+
+        downgraded_inspector = inspect(engine)
+        assert downgraded_inspector.has_table("webhook_endpoints") is True
+        assert downgraded_inspector.has_table("webhook_events") is True
+        assert downgraded_inspector.has_table("webhook_delivery_attempts") is True
+        assert downgraded_inspector.has_table("webhook_delivery_jobs") is True
+        assert [
+            column["name"] for column in downgraded_inspector.get_columns("webhook_events")
+        ] == [
+            "id",
+            "endpoint_id",
+            "event_type",
+            "payload",
+            "created_at",
+        ]
+        assert all(
+            constraint["name"] != constraint_name
+            for constraint in downgraded_inspector.get_unique_constraints("webhook_events")
+        )
+        downgraded_indexes = downgraded_inspector.get_indexes("webhook_events")
+        assert (
+            len(
+                [
+                    index
+                    for index in downgraded_indexes
+                    if index["name"] == "ix_webhook_events_endpoint_id"
+                    and index["column_names"] == ["endpoint_id"]
+                    and index["unique"] is False
+                ]
+            )
+            == 1
+        )
+
+        command.upgrade(alembic_config, "head")
+
+        restored_inspector = inspect(engine)
+        assert "idempotency_key" in {
+            column["name"] for column in restored_inspector.get_columns("webhook_events")
+        }
+        assert (
+            len(
+                [
+                    constraint
+                    for constraint in restored_inspector.get_unique_constraints("webhook_events")
+                    if constraint["name"] == constraint_name
+                    and constraint["column_names"] == ["endpoint_id", "idempotency_key"]
+                ]
+            )
+            == 1
+        )
+    finally:
+        command.upgrade(alembic_config, "head")
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM webhook_delivery_attempts WHERE event_id = :event_id"),
+                {"event_id": event_id},
+            )
+            connection.execute(
+                text("DELETE FROM webhook_delivery_jobs WHERE event_id = :event_id"),
+                {"event_id": event_id},
+            )
+            connection.execute(
+                text("DELETE FROM webhook_events WHERE id = :event_id"),
+                {"event_id": event_id},
+            )
+            connection.execute(
+                text("DELETE FROM webhook_endpoints WHERE id = :endpoint_id"),
+                {"endpoint_id": endpoint_id},
+            )
+
+    final_inspector = inspect(engine)
+    assert "idempotency_key" in {
+        column["name"] for column in final_inspector.get_columns("webhook_events")
+    }
+    assert (
+        len(
+            [
+                constraint
+                for constraint in final_inspector.get_unique_constraints("webhook_events")
+                if constraint["name"] == constraint_name
+                and constraint["column_names"] == ["endpoint_id", "idempotency_key"]
+            ]
+        )
+        == 1
+    )
 
 
 def test_webhook_delivery_job_migration() -> None:

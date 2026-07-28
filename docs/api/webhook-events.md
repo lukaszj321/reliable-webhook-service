@@ -1,14 +1,19 @@
 # Webhook Event API
 
 This API stores webhook events for existing webhook endpoint configurations and atomically creates
-one initial `pending` delivery job for each accepted event. It does not execute the webhook.
+one initial `pending` delivery job for each new event. Optional endpoint-scoped idempotency can
+reuse an equivalent existing event without creating another job. The endpoint does not execute
+the webhook.
 
 ## Contents
 
 - [Endpoint](#endpoint)
+- [Optional idempotency header](#optional-idempotency-header)
 - [Request body](#request-body)
-- [Successful response](#successful-response)
-- [Error responses](#error-responses)
+- [New event response](#new-event-response)
+- [Equivalent request response](#equivalent-request-response)
+- [Conflict response](#conflict-response)
+- [Validation and error responses](#validation-and-error-responses)
 - [Persistence behavior](#persistence-behavior)
 - [Non-goals and current limitations](#non-goals-and-current-limitations)
 - [Navigation](#navigation)
@@ -17,8 +22,44 @@ one initial `pending` delivery job for each accepted event. It does not execute 
 
 - Method: `POST`
 - Path: `/webhook-events`
-- Success status: `201 Created`
+- Success statuses: `201 Created` for a new event; `200 OK` for equivalent keyed reuse
 - Content-Type: `application/json`
+
+## Optional idempotency header
+
+`Idempotency-Key` is an optional HTTP header. It is not part of the JSON body and is not an
+authentication token.
+
+Rules:
+
+- uniqueness is scoped to `(endpoint_id, idempotency_key)`;
+- leading and trailing whitespace is removed;
+- the normalized value must not be empty and must not exceed 255 characters;
+- the value is case-sensitive, and internal whitespace is preserved;
+- the key is not returned in the public response;
+- the same non-null key can be used for different endpoints;
+- keys do not expire, and there is no TTL, deletion API, or automatic cleanup;
+- keys are not documented as encrypted or hashed.
+
+Without the header, every valid request creates a new event and pending job and returns HTTP 201.
+The same body can therefore create multiple unkeyed events.
+
+Example keyed request:
+
+```http
+POST /webhook-events HTTP/1.1
+Host: 127.0.0.1:8000
+Content-Type: application/json
+Idempotency-Key: order-created-ord-12345
+
+{
+  "endpoint_id": "5dce6a1d-f4c7-4c16-b709-2b0d08683ed2",
+  "event_type": "order.created",
+  "payload": {
+    "order_id": "ord-12345"
+  }
+}
+```
 
 ## Request body
 
@@ -71,9 +112,9 @@ Example request:
 }
 ```
 
-## Successful response
+## New event response
 
-The endpoint returns HTTP `201 Created` with these fields:
+An unkeyed request or the first use of a scoped key returns HTTP `201 Created` with these fields:
 
 - `id`
 - `endpoint_id`
@@ -84,8 +125,8 @@ The endpoint returns HTTP `201 Created` with these fields:
 The application generates `id`. PostgreSQL assigns the timezone-aware `created_at` value and stores
 `payload` as `JSONB`. The returned `event_type` has already been trimmed.
 
-The associated delivery job is not part of the response. No public `job_id`, job status, or
-`next_attempt_at` field is returned.
+The associated delivery job is not part of the response. No `idempotency_key`, `created`, `job`,
+`job_id`, job status, `next_attempt_at`, attempt, savepoint, or constraint field is returned.
 
 Example response:
 
@@ -112,7 +153,39 @@ Example response:
 }
 ```
 
-## Error responses
+## Equivalent request response
+
+An equivalent retry with the same endpoint and normalized key returns HTTP `200 OK`. Equivalence
+requires:
+
+- the same endpoint;
+- the same normalized idempotency key;
+- the same normalized event type;
+- an equivalent PostgreSQL `JSONB` payload value.
+
+JSON object key order does not affect equivalence. JSON Boolean and number values remain distinct
+for this contract, so `true` is not equivalent to `1`.
+
+The body has exactly the same five fields as the HTTP 201 response and identifies the same event,
+including the same `id` and `created_at`. No second event or job is created, and the existing event
+and job are not updated. The body has no `created` field; clients distinguish creation from reuse
+through HTTP 201 or HTTP 200.
+
+## Conflict response
+
+Reusing the same scoped key with a different normalized event type or a non-equivalent payload
+returns HTTP `409 Conflict`:
+
+```json
+{
+  "detail": "Idempotency key conflicts with an existing webhook event"
+}
+```
+
+The response does not expose the key, old or new payload, event type, or existing event ID. The
+existing event and job remain unchanged.
+
+## Validation and error responses
 
 HTTP 404 means that the request contained a valid UUID, but no webhook endpoint with that ID exists.
 Neither an event nor a delivery job is created. The response is exactly:
@@ -125,6 +198,10 @@ Neither an event nor a delivery job is created. The response is exactly:
 
 HTTP 422 indicates request validation failure. It is returned for:
 
+- an empty or whitespace-only `Idempotency-Key`, with detail
+  `Idempotency key must not be empty`;
+- an `Idempotency-Key` longer than 255 characters after normalization, with detail
+  `Idempotency key must not exceed 255 characters`;
 - a malformed `endpoint_id`;
 - an empty or whitespace-only `event_type`;
 - an `event_type` longer than 255 characters;
@@ -132,22 +209,27 @@ HTTP 422 indicates request validation failure. It is returned for:
 - a top-level `payload` that is a list, scalar value, or `null`.
 
 Validation failures occur before persistence, so they create neither an event nor a delivery job.
+A valid key with a missing endpoint returns HTTP 404. An invalid key with a missing endpoint
+returns HTTP 422 because key validation occurs before endpoint lookup.
 
 ## Persistence behavior
 
-The persistence flow is:
+The route uses `create_idempotent_webhook_event_with_delivery_job`. For an unkeyed request the
+service creates a new event and job directly. For a keyed request it first looks up the scoped key
+and classifies an existing record as equivalent reuse or conflict.
 
-1. `create_webhook_event_with_delivery_job` checks the referenced `WebhookEndpoint`;
-2. it creates, adds, and flushes the `WebhookEvent`;
-3. the flush provides `event.id` and the server-generated `event.created_at`;
-4. it creates one `WebhookDeliveryJob` with `status=pending`;
-5. it sets `job.event_id=event.id` and `job.next_attempt_at=event.created_at`;
-6. it adds and flushes the job;
-7. the route performs one commit after both flushes.
+A new keyed insert runs inside a nested transaction/savepoint. The PostgreSQL unique constraint on
+`(endpoint_id, idempotency_key)` is the final race safeguard. If another transaction wins the
+insert race, only the savepoint is rolled back: an equivalent loser reads and returns the existing
+event, while a conflicting loser receives the same domain conflict. Unrelated database errors are
+not translated into idempotency conflicts.
 
-Both records use the same caller-owned transaction. Another session sees neither before the
-commit, and both become visible together afterward. A rollback before commit removes both
-uncommitted records. The two flushes are not separate commits.
+For a new event, the service creates and flushes `WebhookEvent`, then creates and flushes one
+`WebhookDeliveryJob` with `status=pending`, `event_id=event.id`, and
+`next_attempt_at=event.created_at`. Both records remain in the caller-owned outer transaction.
+The route performs one outer commit, so another session sees neither before commit and both
+afterward. Duplicate reuse creates no records but still leaves outer transaction completion to the
+caller.
 
 An endpoint whose `is_active` value is `false` can still accept an event and receive a pending job.
 Because `next_attempt_at` represents the same instant as `event.created_at`, the job is immediately
@@ -183,7 +265,14 @@ and persistence details.
 - The API does not control the worker lifecycle and exposes no worker start, stop, or status
   endpoint. Polling, due retry execution, and stale recovery run only while an operator has
   explicitly started the separate worker process.
-- Exactly-once delivery, idempotency, and replay are not implemented.
+- Event-ingestion idempotency is implemented only for `POST /webhook-events`. Downstream delivery
+  idempotency is not implemented: the service does not forward `Idempotency-Key` to the target and
+  cannot guarantee target-side deduplication.
+- Exactly-once delivery is not implemented. HTTP may reach the target before a completion
+  transaction fails, allowing recovery and later processing to deliver again.
+- Manual replay is not implemented. The manual delivery endpoint performs a new synchronous
+  attempt; it does not reset a job, restore a dead-letter job, or implement a replay lifecycle.
+- Idempotency keys have no expiration, deletion endpoint, or automatic cleanup.
 - No payload size limit is configured.
 - Authentication is not implemented.
 

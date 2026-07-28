@@ -75,17 +75,23 @@ python -m alembic check
 
 **Current head**
 
+- Revision ID: `9970fa5ecbab`
+- Description: `add webhook event idempotency key`
+- Down revision: `200628ca5044`
+
+**Previous revision**
+
 - Revision ID: `200628ca5044`
 - Description: `create webhook delivery jobs`
 - Down revision: `10f4dd620e97`
 
-**Previous revision**
+**Earlier revision**
 
 - Revision ID: `10f4dd620e97`
 - Description: `create webhook delivery attempts`
 - Down revision: `df51b920cf81`
 
-**Earlier revision**
+**Event revision**
 
 - Revision ID: `df51b920cf81`
 - Description: `create webhook events`
@@ -97,6 +103,10 @@ python -m alembic check
 - Description: `create webhook endpoints`
 - Down revision: `None`
 - This is the first migration in the project.
+
+Revision `9970fa5ecbab` adds only the nullable `idempotency_key` column and its scoped unique
+constraint. Existing events retain `NULL`; the migration performs no backfill. Its downgrade
+removes only the unique constraint and the column.
 
 ## Database schema
 
@@ -125,6 +135,7 @@ persistence does not execute webhook delivery.
 | `endpoint_id` | `UUID` | No | None | Foreign key to `webhook_endpoints.id` |
 | `event_type` | `VARCHAR(255)` | No | None | Event type identifier |
 | `payload` | `JSONB` | No | None | Structured webhook event payload |
+| `idempotency_key` | `VARCHAR(255)` | Yes | None | Optional endpoint-scoped event-ingestion key |
 | `created_at` | `TIMESTAMP WITH TIME ZONE` | No | `now()` | Creation timestamp |
 
 - `endpoint_id` has the non-unique index `ix_webhook_events_endpoint_id` and references
@@ -135,6 +146,12 @@ persistence does not execute webhook delivery.
   default `now()`.
 - `payload` uses PostgreSQL `JSONB` and supports nested objects, lists, numbers, Boolean values, and
   `null`. The model requires the top-level payload to be a JSON object.
+- `uq_webhook_events_endpoint_id_idempotency_key` applies to `endpoint_id` and
+  `idempotency_key`. It rejects a repeated non-null key for the same endpoint but permits that key
+  for another endpoint.
+- PostgreSQL unique-constraint `NULL` semantics permit multiple unkeyed events for one endpoint.
+  There is no separate application-defined idempotency index beyond the structure PostgreSQL
+  maintains for the unique constraint.
 - In-place mutations of nested JSONB values are not tracked through `MutableDict`, because
   `MutableDict` is not configured.
 - `WebhookEvent` has no ORM relationship with `WebhookEndpoint`. The association is represented by
@@ -296,20 +313,35 @@ attempts are removed, deleting the event also deletes its job through the databa
 
 ## Atomic event and delivery job creation
 
-`POST /webhook-events` uses `create_webhook_event_with_delivery_job` to prepare one
-`WebhookEvent` and one associated `WebhookDeliveryJob` in the same caller-owned transaction.
+`POST /webhook-events` uses `create_idempotent_webhook_event_with_delivery_job`. A new request
+prepares one `WebhookEvent` and one associated `WebhookDeliveryJob` in the same caller-owned outer
+transaction. The compatible `create_webhook_event_with_delivery_job` wrapper remains available for
+unkeyed callers but is not the primary HTTP path.
 
 ### Service boundary
 
-The service receives the caller's SQLAlchemy `Session` and checks the endpoint with
-`session.get(WebhookEndpoint, endpoint_id)`. A missing endpoint raises
-`WebhookEndpointNotFoundError` before either record is added. An inactive endpoint is accepted and
-receives the same initial `pending` job as an active endpoint. The service is independent of
+The service receives the caller's SQLAlchemy `Session` and normalizes the optional key before
+checking the endpoint. A missing endpoint raises `WebhookEndpointNotFoundError` before either
+record is added, while an invalid key fails before that lookup. An inactive endpoint is accepted
+and receives the same initial `pending` job as an active endpoint. The service is independent of
 FastAPI.
+
+### Idempotency paths
+
+- Without a key, every accepted call creates a new event and pending job.
+- A new scoped key creates a new event and pending job.
+- An existing scoped key with the same normalized event type and an equivalent PostgreSQL `JSONB`
+  payload returns the existing event without creating or updating records.
+- An existing scoped key with different content raises an idempotency conflict without changing
+  the existing event or job.
+
+JSON object key order does not affect PostgreSQL `JSONB` equality. JSON Boolean and number values
+remain distinct for this contract. The database constraint checks only the scoped key; the service
+classifies equivalence or conflict using event type and JSONB equality.
 
 ### Persistence sequence
 
-The service performs this sequence:
+For a new event, the service performs this sequence:
 
 1. creates the `WebhookEvent`;
 2. calls `session.add(event)`;
@@ -323,14 +355,24 @@ The service performs this sequence:
 10. calls `session.flush()`;
 11. returns the `WebhookEvent`.
 
-The two flushes send changes through the same transaction; they are not commits.
+The two flushes send changes through the same outer transaction; they are not commits.
+
+### Savepoint race handling
+
+A pre-insert lookup handles the normal keyed path, while
+`uq_webhook_events_endpoint_id_idempotency_key` remains the final source of truth under
+concurrency. A keyed insert uses a nested transaction/savepoint. If another transaction wins the
+same scoped-key race, only that savepoint is rolled back and the outer transaction remains usable.
+An equivalent loser reads the winner's event; a conflicting loser receives the domain conflict.
+Unrelated integrity and database errors are not translated into an idempotency conflict.
 
 ### Atomic creation transaction ownership
 
 The service does not commit, roll back, or close the caller's session. After both flushes, the API
-route performs one commit. Before that commit, another session sees neither the event nor its job.
-After the commit, both records become visible together. A caller rollback removes both uncommitted
-records.
+route performs one outer commit. Before that commit, another session sees neither the event nor
+its job. After the commit, both records become visible together. A caller rollback removes both
+uncommitted records. Equivalent reuse creates no event or job and leaves completion of the
+read-only outer transaction to the caller.
 
 For this API path, a successful committed event therefore has its initial job. The database itself
 does not require every event to have a job: it enforces at most one job per event through
@@ -345,10 +387,11 @@ PostgreSQL continues to manage the job's `created_at` and `updated_at` server de
 
 ### API boundary
 
-The public response contains only the `WebhookEvent`: `id`, `endpoint_id`, `event_type`, `payload`,
-and `created_at`. It does not expose the job, a job ID, job status, or `next_attempt_at`. No public
-delivery-job API exists, and creating the durable job does not execute delivery, create an attempt,
-invoke claiming, apply retry policy, or invoke the bounded worker iteration.
+HTTP 201 creation and HTTP 200 equivalent reuse return the same public `WebhookEvent` shape:
+`id`, `endpoint_id`, `event_type`, `payload`, and `created_at`. It does not expose the
+idempotency key, a `created` flag, the job, a job ID, job status, or `next_attempt_at`. No public
+delivery-job API exists, and creating the durable job does not execute delivery, create an
+attempt, invoke claiming, apply retry policy, or invoke the bounded worker iteration.
 
 ## Delivery job claiming
 
@@ -454,7 +497,8 @@ the processing cycle separately; the one-shot bounded worker iteration explicitl
 cycle immediately after a successful recovery commit and session close. PostgreSQL cannot
 determine whether an earlier HTTP request reached the remote target. If it did but completion was
 not committed, later processing of the recovered job can cause duplicate delivery. Recovery
-performs no remote verification and does not provide idempotency or exactly-once delivery.
+performs no remote verification and does not provide downstream delivery idempotency or
+exactly-once delivery.
 
 ## Long-running worker process
 
@@ -601,6 +645,7 @@ through SQLAlchemy's ORM configuration.
 - The application-side SQLAlchemy default uses `uuid.uuid4` to generate the event UUID.
 - PostgreSQL assigns `created_at` through the server default `now()`.
 - The payload is stored as PostgreSQL `JSONB`.
+- The optional `idempotency_key` is nullable `String(255)` and has no default.
 - The model has no `updated_at` column and no ORM relationship with `WebhookEndpoint`.
 - The foreign key does not provide cascade delete.
 - `POST /webhook-events` verifies the referenced endpoint and prepares a `WebhookEvent` together
@@ -608,8 +653,9 @@ through SQLAlchemy's ORM configuration.
 - An inactive endpoint can still accept an event through the creation API.
 - The event and job are flushed in one caller-owned transaction, and the route commits them
   together once.
-- Alembic manages the `webhook_events` schema. The event creation API uses the existing schema, so
-  it does not require a separate migration.
+- The public route uses `create_idempotent_webhook_event_with_delivery_job`; the compatible
+  unkeyed wrapper remains available for other callers.
+- Alembic revision `9970fa5ecbab` manages the idempotency column and scoped unique constraint.
 
 **WebhookDeliveryJob**
 
@@ -631,8 +677,8 @@ through SQLAlchemy's ORM configuration.
   but it does not commit, roll back, or close the session.
 - The bounded processing cycle explicitly connects claim and completion: it commits and closes one
   claim session, then owns one fresh completion session per claimed job.
-- `create_webhook_event_with_delivery_job` creates the initial job from the flushed event ID and
-  timestamp without committing, rolling back, or closing the caller's session.
+- The idempotent event service creates an initial job from the flushed event ID and timestamp
+  without committing, rolling back, or closing the caller's outer session.
 - A unique constraint allows at most one job per event.
 - Deleting an event removes its job through database `ON DELETE CASCADE`.
 - `SessionFactory` continues to use `expire_on_commit=False`.
@@ -677,8 +723,10 @@ characters. Code that uses the ORM model directly bypasses this API validation. 
 `event_type` to between 1 and 255 characters, and requires `payload` to be a top-level JSON object.
 The payload is stored as PostgreSQL `JSONB`. Nested objects, lists, JSON scalars, and `null` are
 supported within the object, but no payload size limit or event-specific schema is configured.
-Inactive endpoints can accept events. `POST /webhook-events` does not deliver the event or create
-a delivery attempt and does not invoke retry or replay behavior. `WebhookDeliveryAttempt`
+The optional `Idempotency-Key` is trimmed, remains case-sensitive, and must contain 1 through 255
+characters after normalization. It is endpoint-scoped and is not part of the JSON body. Inactive
+endpoints can accept events. `POST /webhook-events` does not deliver the event or create a
+delivery attempt and does not invoke retry or replay behavior. `WebhookDeliveryAttempt`
 constraints are enforced by PostgreSQL for ORM persistence, but no public request schema or API
 endpoint currently accepts delivery attempt data. See
 [Webhook event API](api/webhook-events.md) for the complete request and response behavior.

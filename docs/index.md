@@ -1,8 +1,8 @@
 # Documentation
 
-This documentation covers local development, PostgreSQL persistence, atomic event and initial job
-creation, delivery job claiming, manual webhook execution, internal atomic attempt-plus-job
-completion, the explicitly started
+This documentation covers local development, PostgreSQL persistence, endpoint-scoped idempotent
+event ingestion, atomic event and initial job creation, delivery job claiming, manual webhook
+execution, internal atomic attempt-plus-job completion, the explicitly started
 [long-running worker process](delivery-execution.md#long-running-worker-process), its
 framework-independent worker loop and one-shot
 [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), partial-progress
@@ -23,9 +23,10 @@ Read the documentation in this order:
 
 - [Development setup](development.md) — install, configure, run, and validate the project locally.
 - [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
-  migrations, atomic event and job transactions, the current schema, and delivery job claiming
-  and recovery transaction semantics with `SKIP LOCKED`, including the separate recovery, claim,
-  and per-job completion boundaries used by a bounded worker iteration.
+  migrations, idempotency-key persistence and race handling, atomic event and job transactions,
+  the current schema, and delivery job claiming and recovery transaction semantics with
+  `SKIP LOCKED`, including the separate recovery, claim, and per-job completion boundaries used by
+  a bounded worker iteration.
 - [Webhook delivery execution](delivery-execution.md) — the explicitly started long-running worker
   process, environment-driven worker configuration, polling, graceful shutdown, manual execution,
   `execute_webhook_delivery_job`, the
@@ -41,8 +42,9 @@ Read the documentation in this order:
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
   listing behavior.
-- [Webhook event API](api/webhook-events.md) — event validation, atomic event and pending job
-  persistence, the event-only response, and error behavior.
+- [Webhook event API](api/webhook-events.md) — optional endpoint-scoped `Idempotency-Key`, event
+  validation, `201` creation, `200` equivalent reuse, conflict handling, atomic event and pending
+  job persistence, and the unchanged event-only response.
 - [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`,
   including the manual route commit and unchanged completed-attempt response, plus read-only
   listing with `GET`, outcomes, ordering, and error responses.
@@ -81,7 +83,10 @@ Read the documentation in this order:
 - [List webhook endpoints](api/webhook-endpoints.md#list-webhook-endpoints)
 - [Review request validation](api/webhook-endpoints.md#request-validation)
 - [Create a webhook event](api/webhook-events.md#endpoint)
+- [Review idempotent event ingestion](api/webhook-events.md#optional-idempotency-header)
+- [Review webhook event status and error behavior](api/webhook-events.md#validation-and-error-responses)
 - [Review webhook event persistence behavior](api/webhook-events.md#persistence-behavior)
+- [Review idempotency persistence and concurrency](database.md#atomic-event-and-delivery-job-creation)
 - [Manually execute one webhook delivery](api/webhook-delivery-attempts.md#manual-delivery-endpoint)
 - [List delivery attempts](api/webhook-delivery-attempts.md#listing-endpoint)
 
