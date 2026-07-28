@@ -259,6 +259,7 @@ An invalid UUID returns FastAPI HTTP 422 with its standard validation payload.
 
 ## Navigation
 
+- [Architecture](../architecture.md)
 - [API documentation index](index.md)
 - [Webhook endpoint API](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)

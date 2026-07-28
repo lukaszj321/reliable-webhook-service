@@ -16,14 +16,18 @@ attempt history.
 
 Read the documentation in this order:
 
-1. [Development setup](development.md)
-2. [Database and migrations](database.md)
-3. [Webhook delivery execution](delivery-execution.md)
-4. [Operational endpoints](operations.md)
-5. [API documentation](api/index.md)
+1. [Architecture](architecture.md)
+2. [Development setup](development.md)
+3. [Database and migrations](database.md)
+4. [Webhook delivery execution](delivery-execution.md)
+5. [Operational endpoints](operations.md)
+6. [API documentation](api/index.md)
+7. [Changelog](../CHANGELOG.md)
 
 ## Documentation map
 
+- [Architecture](architecture.md) — system context, focused runtime flows, transaction boundaries,
+  guarantees, limitations, and a source map.
 - [Development setup](development.md) — install, configure, run, and validate the project locally.
 - [Database and migrations](database.md) — PostgreSQL connection configuration, Alembic
   migrations, idempotency-key persistence and race handling, atomic event and job transactions,
@@ -56,9 +60,12 @@ Read the documentation in this order:
 - [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`,
   including the manual route commit and unchanged completed-attempt response, plus read-only
   listing with `GET`, outcomes, ordering, and error responses.
+- [Changelog](../CHANGELOG.md) — stable release history and important limitations.
 
 ## Common tasks
 
+- [Understand the system architecture](architecture.md#system-context)
+- [Review transaction boundaries](architecture.md#transaction-boundaries)
 - [Set up the development environment](development.md#create-a-virtual-environment)
 - [Configure local environment variables](development.md#configure-the-local-environment)
 - [Start PostgreSQL](development.md#start-postgresql)
@@ -104,4 +111,6 @@ Read the documentation in this order:
 
 ## Navigation
 
+- [Architecture](architecture.md)
+- [Changelog](../CHANGELOG.md)
 - [Project README](../README.md)

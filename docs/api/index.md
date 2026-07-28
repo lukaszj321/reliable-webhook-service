@@ -101,6 +101,7 @@ FastAPI exposes interactive API documentation when the application is running lo
 
 ## Navigation
 
+- [Architecture](../architecture.md)
 - [Webhook endpoint API](webhook-endpoints.md)
 - [Webhook event API](webhook-events.md)
 - [Webhook delivery job API](webhook-delivery-jobs.md)

@@ -222,4 +222,6 @@ The second command permanently removes the local PostgreSQL data stored in the C
 ## Navigation
 
 - [Documentation index](index.md)
+- [Architecture](architecture.md)
+- [Changelog](../CHANGELOG.md)
 - [Project README](../README.md)

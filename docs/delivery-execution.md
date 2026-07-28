@@ -63,7 +63,7 @@ HTTP request and does not provide exactly-once delivery.
 
 ## Long-running worker process
 
-### Purpose
+### Worker loop purpose
 
 The long-running worker process is started explicitly by an operator. Its framework-independent
 worker loop repeats the existing one-shot worker iteration without duplicating stale recovery,
@@ -128,7 +128,7 @@ cancel an HTTP request, transaction, or commit: the current iteration finishes a
 iteration starts. On exit, the CLI closes the HTTP client, restores previous signal handlers, and
 disposes the engine. Normal shutdown maps to exit code `0`.
 
-### Failure behavior
+### Worker process failure behavior
 
 An unhandled iteration failure propagates out of the worker loop. No later iteration or poll wait
 starts, and there is no immediate worker-level retry or recovery compensation. Lower-level
@@ -149,7 +149,7 @@ HTTP client across iterations. The worker loop borrows these dependencies and do
 dispose them. The CLI closes the client and disposes the engine on normal and fatal exit paths;
 lower-level services continue to own their individual session boundaries.
 
-### Still not implemented
+### Worker process boundaries
 
 - scheduler or cron integration;
 - systemd or Windows service definitions;
@@ -162,7 +162,7 @@ lower-level services continue to own their individual session boundaries.
 
 ## Bounded worker iteration
 
-### Purpose
+### Worker iteration purpose
 
 `run_webhook_worker_iteration` is a synchronous, framework-independent orchestration service. One
 explicit internal invocation runs exactly one bounded stale-job recovery phase and then exactly
@@ -172,7 +172,7 @@ schedule itself, or start automatically.
 The service does not import FastAPI or `Settings`. The caller supplies every dependency and
 configuration value.
 
-### Inputs
+### Worker iteration inputs
 
 The caller supplies:
 
@@ -184,7 +184,7 @@ The caller supplies:
 - maximum attempts and base and maximum retry delays;
 - explicit attempt, decision, and monotonic clocks when deterministic timing is required.
 
-### Validation
+### Worker iteration validation
 
 Before creating a database session, the iteration validates:
 
@@ -240,7 +240,7 @@ The independent limits can therefore produce any of these valid outcomes:
 - a recovered job is claimed and completed in the same iteration;
 - recovery is empty while processing still claims existing due jobs.
 
-### Result
+### Worker iteration result
 
 `WebhookWorkerIterationResult` is an immutable composed snapshot with:
 
@@ -252,7 +252,7 @@ The independent limits can therefore produce any of these valid outcomes:
 
 The result contains no SQLAlchemy session, ORM object, or mutable collection.
 
-### Failure boundaries
+### Worker iteration failure boundaries
 
 #### Validation failure
 
@@ -308,7 +308,7 @@ transaction fails, later stale recovery and redelivery can duplicate that reques
 does not provide exactly-once delivery, downstream delivery idempotency, or remote-side
 deduplication.
 
-### Still not implemented
+### Worker iteration boundaries
 
 - self-scheduling or an application-startup hook;
 - scheduler or service-manager integration;
@@ -319,7 +319,7 @@ deduplication.
 
 ## Bounded delivery processing cycle
 
-### Purpose
+### Processing cycle purpose
 
 `run_webhook_delivery_processing_cycle` is a synchronous, framework-independent orchestration
 service. One explicit internal invocation connects one call to
@@ -330,7 +330,7 @@ not a long-running worker or polling loop.
 The cycle does not import FastAPI or `Settings`, does not start automatically, and does not sleep
 or invoke another cycle. Application code must provide all dependencies and call it explicitly.
 
-### Inputs
+### Processing cycle inputs
 
 The caller supplies:
 
@@ -342,7 +342,7 @@ The caller supplies:
 - maximum attempts and base and maximum retry delays;
 - explicit attempt, decision, and monotonic clocks when deterministic timing is required.
 
-### Validation
+### Processing cycle validation
 
 Before opening the first session, the cycle validates:
 
@@ -389,7 +389,7 @@ The cycle iterates over the snapshotted UUIDs in claim order. For each started j
 
 A failure is propagated immediately, so no later claimed UUID is started.
 
-### Result
+### Processing cycle result
 
 `WebhookDeliveryProcessingCycleResult` is an immutable snapshot containing:
 
@@ -420,7 +420,7 @@ completed jobs to `pending`. The standalone bounded cycle does not invoke recove
 worker iteration invokes recovery before its one processing cycle, and an explicitly started
 long-running worker repeats that recovery-before-processing sequence on each poll.
 
-### Failure boundaries
+### Processing cycle failure boundaries
 
 | Failure | Transaction outcome | Session outcome | Further processing |
 |---|---|---|---|
@@ -438,7 +438,7 @@ External HTTP is not part of the PostgreSQL transaction. An HTTP request can rea
 before the current completion transaction is rolled back, and PostgreSQL rollback cannot undo that
 external side effect. The bounded cycle therefore does not guarantee exactly-once delivery.
 
-### Still not implemented
+### Processing cycle boundaries
 
 - self-repetition within the bounded processing cycle;
 - scheduler or application-startup invocation;
@@ -451,7 +451,7 @@ external side effect. The bounded cycle therefore does not guarantee exactly-onc
 
 ## Stale processing job recovery
 
-### Cycle purpose
+### Recovery purpose
 
 A job can remain `processing` when its claim transaction commits but the process stops before its
 per-job completion commits. A later completion failure can also leave later jobs from the same
@@ -461,7 +461,7 @@ claimed batch unstarted in `processing`.
 explicit bounded recovery batch. It does not run automatically and is not a long-running worker,
 polling loop, scheduler, background task, or application startup hook.
 
-### Cycle inputs
+### Recovery inputs
 
 The caller supplies:
 
@@ -470,7 +470,7 @@ The caller supplies:
 - `recovered_at`, the timestamp assigned to recovered state;
 - `limit`, the maximum number of jobs in this bounded recovery batch.
 
-### Cycle validation
+### Recovery validation
 
 Before executing SQL, the service requires:
 
@@ -532,7 +532,7 @@ roll back, or close the session:
 When no job is eligible, the service returns an empty immutable result. It performs no flush,
 mutation, commit, rollback, or close.
 
-### Cycle result
+### Recovery result
 
 `WebhookDeliveryJobRecoveryResult` contains:
 
@@ -558,7 +558,7 @@ cannot undo HTTP. Recovery performs no remote verification, creates no missing a
 performs no compensating action. Event-ingestion idempotency does not forward its key to the
 target, so downstream delivery idempotency and exactly-once delivery are not provided.
 
-### Cycle capabilities still not implemented
+### Recovery boundaries
 
 - self-invocation by the recovery service;
 - scheduler or application startup hook;
@@ -779,7 +779,7 @@ retryable `pending`, and final `dead_letter` transitions. After rollback, the en
 remain and the job returns to its previously committed `processing` state. Every accepted
 completion performs exactly one external HTTP request.
 
-### Failure behavior
+### Delivery completion failure behavior
 
 Delivery preparation errors propagate without wrapping. An inactive endpoint creates no attempt
 and leaves the job unchanged. Attempt flush errors, retry policy validation errors, and job flush
@@ -991,6 +991,7 @@ the same iteration.
 
 - [Project README](../README.md)
 - [Documentation index](index.md)
+- [Architecture](architecture.md)
 - [Database and migrations](database.md)
 - [API documentation](api/index.md)
 - [Webhook event API](api/webhook-events.md)

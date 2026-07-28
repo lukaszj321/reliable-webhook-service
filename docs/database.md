@@ -127,7 +127,7 @@ retry-budget behavior conservatively. After migration, manual delivery no longer
 
 ## Database schema
 
-### webhook_endpoints
+### Webhook endpoint table
 
 The `webhook_endpoints` table stores configurations for webhook destination addresses.
 
@@ -771,6 +771,8 @@ schema invokes neither the cycle nor the separate stale processing job recovery 
 ## Navigation
 
 - [Documentation index](index.md)
+- [Architecture](architecture.md)
 - [Development setup](development.md)
 - [Webhook delivery execution](delivery-execution.md)
+- [Operational endpoints](operations.md)
 - [Project README](../README.md)

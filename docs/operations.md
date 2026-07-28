@@ -250,6 +250,7 @@ behavior are unchanged.
 ## Navigation
 
 - [Documentation index](index.md)
+- [Architecture](architecture.md)
 - [API documentation](api/index.md)
 - [Webhook delivery job API](api/webhook-delivery-jobs.md)
 - [Webhook delivery execution](delivery-execution.md)
