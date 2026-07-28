@@ -337,6 +337,7 @@ before a later replay request.
 
 ## Navigation
 
+- [Architecture](../architecture.md)
 - [API documentation index](index.md)
 - [Webhook delivery job API](webhook-delivery-jobs.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)

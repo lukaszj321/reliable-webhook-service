@@ -183,6 +183,7 @@ should restrict operational inspection according to their access-control require
 
 ## Navigation
 
+- [Architecture](../architecture.md)
 - [API documentation index](index.md)
 - [Webhook event API](webhook-events.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)

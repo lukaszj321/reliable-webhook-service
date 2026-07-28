@@ -23,7 +23,7 @@ Webhook endpoint responses contain exactly six fields:
 - `created_at` — timezone-aware creation timestamp.
 - `updated_at` — timezone-aware last modification timestamp.
 
-See the [`webhook_endpoints` database schema](../database.md#webhook_endpoints) for persistence
+See the [`webhook_endpoints` database schema](../database.md#webhook-endpoint-table) for persistence
 details.
 
 ## Create a webhook endpoint
@@ -121,6 +121,7 @@ Example response:
 
 ## Navigation
 
+- [Architecture](../architecture.md)
 - [API documentation index](index.md)
 - [Webhook delivery attempt API](webhook-delivery-attempts.md)
 - [Database and migrations](../database.md)
