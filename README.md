@@ -12,6 +12,8 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - [Architecture](#architecture)
 - [Technology stack](#technology-stack)
 - [Quick start](#quick-start)
+- [Worker configuration](#worker-configuration)
+- [Run the worker](#run-the-worker)
 - [Available API](#available-api)
 - [Quality checks](#quality-checks)
 - [Documentation](#documentation)
@@ -78,7 +80,8 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Configurable total attempt limit and exponential-backoff base and maximum delay settings
 - Pure, deterministic retry policy with no jitter that returns `pending`, `succeeded`, or
   `dead_letter` decisions and normalizes timezone-aware `next_attempt_at` values to UTC
-- The retry policy is connected to internal job completion but is not invoked automatically
+- The retry policy is connected to internal job completion; a running worker can execute a
+  scheduled retry in a later iteration after `next_attempt_at` becomes due
 - Internal, synchronous `run_webhook_delivery_processing_cycle` orchestration for one explicitly
   invoked bounded batch
 - One dedicated claim transaction is committed and closed before HTTP; claimed job IDs are then
@@ -109,33 +112,58 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Recovery and processing are separate transaction boundaries: a processing failure cannot undo
   the durable recovery commit, earlier per-job completion commits remain durable, and there is no
   iteration-wide transaction or batch rollback
+- Framework-independent synchronous worker loop that repeatedly invokes the existing one-shot
+  worker iteration without duplicating recovery, processing, completion, or retry logic
+- Runnable worker CLI through `python -m reliable_webhook_service.worker`; importing the module
+  does not start execution
+- Environment-driven worker settings for the poll interval, stale-processing timeout, recovery
+  batch limit, and processing batch limit
+- The first iteration starts without a preceding wait; successful later iterations are separated
+  by `threading.Event.wait` for the poll interval
+- Every iteration performs stale recovery before processing. While the worker runs, it claims due
+  pending jobs and executes scheduled retries in later iterations after they become due
+- The API process and long-running worker process are separate explicitly started processes.
+  Event creation and FastAPI startup do not start or control the worker
+- The worker process creates and owns a local engine and local session factory rather than using
+  the application's global `SessionFactory`
+- One shared HTTP client is reused across iterations and closed when the worker exits
+- One shutdown `threading.Event` is set by handlers for `SIGINT` and, where available, `SIGTERM`
+- Graceful shutdown finishes the active one-shot worker iteration, starts no next iteration,
+  restores previous signal handlers, closes the HTTP client, and calls `engine.dispose()`
+- Normal shutdown maps to exit code `0`; an unhandled ordinary fatal error maps to exit code `1`
+  without an immediate worker-level retry
+- Lifecycle logging reports safe aggregate state without payloads, secrets, or full response
+  bodies
+- The API process serves HTTP; the long-running worker process owns runtime resources; its worker
+  loop controls polling; each one-shot worker iteration performs a recovery phase followed by one
+  processing cycle; each claimed job uses its own completion transaction
 - HTTP 404 for a missing event and HTTP 409 for a missing or inactive endpoint before execution
-- Manual-only execution: creating a webhook event does not trigger delivery automatically
+- Event-creation boundary: creating a webhook event persists work but does not execute delivery
+  within the API request
 - Read-only `GET /webhook-events/{event_id}/delivery-attempts` listing stored completed attempts for
   one existing event; it returns an empty list when none exist, returns HTTP 404 for a missing
   event, and does not create or modify attempts
 - Integration tests against real PostgreSQL
 - GitHub Actions CI with Ruff and strict mypy validation
-- The bounded worker iteration is a one-shot internal service invoked explicitly; no long-running
-  worker process, worker loop, polling, sleep, scheduler, CLI, startup hook, automatic invocation,
-  lease ownership, heartbeat, or public delivery-job API exists
+- The bounded worker iteration remains a one-shot internal service even when repeated by the
+  long-running worker loop; no public delivery-job or worker-lifecycle API exists
 
 ## Planned scope
 
 The following capabilities are planned but are not currently implemented:
 
-- Long-running worker process, worker loop, and polling
-- Worker sleep interval and graceful shutdown
-- Worker CLI, scheduler, and application startup hook
-- Environment-driven worker configuration
-- Automatic worker or bounded-cycle invocation
-- Automatic execution of retries already scheduled as `pending`
-- Automatic stale `processing` recovery invocation and timeout configuration
-- Leases, lease ownership, and heartbeat
+- Automatic worker startup with the API or through FastAPI lifespan
+- Scheduler-managed deployments and cron integration
+- Operating-system service files, including systemd units and a Windows service
+- Kubernetes manifests and cloud deployment
+- Coordination of multiple workers, distributed leader election, leases, lease ownership, and
+  heartbeat
+- Parallel delivery completion
+- Configurable worker-level retry after a fatal iteration failure
 - Remote delivery verification
-- Idempotency
+- Idempotency keys
 - Exactly-once delivery
-- Automatic delivery execution after event creation
+- Direct delivery execution inside the event-creation API request
 - Manual replay
 
 ## Non-goals
@@ -145,7 +173,8 @@ The following capabilities are planned but are not currently implemented:
 
 ## Architecture
 
-The diagram shows only the currently implemented application path.
+The diagram shows the implemented API, one-shot orchestration, and explicitly started worker
+process paths.
 
 ```mermaid
 flowchart LR
@@ -212,7 +241,6 @@ flowchart LR
     RecoverySession -->|"one flush; no internal commit"| RecoveryEnd["Caller commit or rollback<br/>then close"]
     RecoveryService --> RecoveryIDs["Immutable recovered UUID snapshot"]
     RecoveryService --> RecoveryNoIO["No HTTP and no attempt creation<br/>duplicate-delivery risk if earlier HTTP was uncertain"]
-    FutureCycleCaller["Separate future explicit caller"] -->|"later explicit invocation only"| Cycle
     WorkerCaller["Explicit internal worker-iteration caller<br/>one-shot; no automatic invocation"]
     WorkerCaller --> WorkerValidation["Validate all orchestration inputs<br/>before session creation"]
     WorkerValidation --> WorkerIteration["run_webhook_worker_iteration"]
@@ -230,6 +258,43 @@ flowchart LR
     Result --> WorkerResult
     Cycle -->|"failure after durable recovery commit"| WorkerPartial["No recovery compensation<br/>earlier completion commits remain"]
     WorkerPartial --> WorkerDuplicate["Partial progress<br/>possible duplicate remote delivery"]
+    Operator["Operator"] -->|"starts explicitly"| WorkerCLI["Module worker CLI<br/>python -m reliable_webhook_service.worker"]
+    WorkerCLI --> WorkerSettings["Settings created once"]
+    WorkerCLI --> LocalEngine["Local SQLAlchemy engine"]
+    LocalEngine --> LocalSessionFactory["Local sessionmaker"]
+    WorkerCLI --> SharedRawHTTP["Shared raw HTTP client"]
+    SharedRawHTTP --> HTTPWrapper["Httpx2WebhookHttpClient"]
+    HTTPWrapper --> HTTPClient
+    WorkerCLI --> ShutdownEvent["One shutdown threading.Event"]
+    SIGINT["SIGINT"] --> SignalHandler["Signal handler<br/>sets Event only"]
+    SIGTERM["SIGTERM when available"] --> SignalHandler
+    SignalHandler --> ShutdownEvent
+    WorkerCLI -->|"invokes exactly once"| WorkerLoop["Framework-independent worker loop"]
+    WorkerSettings --> WorkerLoop
+    LocalSessionFactory --> WorkerLoop
+    HTTPWrapper --> WorkerLoop
+    ShutdownEvent --> WorkerLoop
+    WorkerLoop --> StopBefore{"Stop requested<br/>before iteration?"}
+    StopBefore -->|"no"| IterationTimestamp["One UTC iteration timestamp"]
+    IterationTimestamp --> StaleCutoff["Derive stale cutoff<br/>iteration_at - timeout"]
+    StaleCutoff -->|"one-shot call"| WorkerIteration
+    WorkerResult --> StopAfter{"Stop requested<br/>after iteration?"}
+    StopAfter -->|"no"| PollWait["Event.wait<br/>poll interval"]
+    ShutdownEvent --> PollWait
+    PollWait -->|"not stopped"| StopBefore
+    StopBefore -->|"yes"| GracefulStop["Graceful stop"]
+    StopAfter -->|"yes"| GracefulStop
+    PollWait -->|"stop requested"| GracefulStop
+    GracefulStop --> NormalClose["Close shared HTTP client"]
+    NormalClose --> NormalRestore["Restore signal handlers"]
+    NormalRestore --> NormalDispose["Dispose local engine"]
+    NormalDispose --> ExitZero["Exit code 0"]
+    WorkerIteration -->|"fatal ordinary Exception"| FatalStop["Terminate worker loop<br/>no wait or worker-level retry"]
+    FatalStop --> FatalClose["Close shared HTTP client"]
+    FatalClose --> FatalRestore["Restore signal handlers"]
+    FatalRestore --> FatalDispose["Dispose local engine"]
+    FatalDispose --> ExitOne["Exit code 1"]
+    WorkerCLI --> WorkerBoundary["Separate from API process<br/>not started by FastAPI or event creation"]
     Migrations["Alembic migrations"] -->|"manages schema"| PostgreSQL
 ```
 
@@ -260,7 +325,8 @@ The service selects one bounded batch of stale `processing` jobs through determi
 roll back, or close the session. The caller commits the entire batch or rolls it back, then closes
 the session. A standalone recovery call requires a later explicit processing-cycle invocation;
 the bounded worker iteration can instead provide that recovery-before-processing sequence in one
-explicit orchestration call.
+explicit orchestration call. The running worker invokes that one-shot orchestration on successive
+polls.
 
 **Bounded worker-iteration orchestration.** An explicit internal caller invokes
 `run_webhook_worker_iteration` once. The service validates every orchestration argument before
@@ -296,21 +362,27 @@ The cycle returns immutable snapshots of claimed IDs and completed job values ra
 objects. If job A commits and job B later fails, A remains completed, B's current completion is
 rolled back, and B plus any later claimed jobs remain `processing` because the claim transaction
 was already committed. There is no batch-level atomicity or batch rollback. The explicit recovery
-service can later return sufficiently old `processing` jobs to `pending`, but nothing invokes it
-automatically.
+service can later return sufficiently old `processing` jobs to `pending`; the running worker
+invokes recovery before processing in every later iteration.
 
 The external HTTP request is not part of the PostgreSQL transaction. A rollback cannot undo an
 HTTP request that already reached the target. If that request succeeded remotely but completion
-was not committed, recovery followed by a later explicit cycle can send the webhook again.
+was not committed, recovery followed by a later processing cycle can send the webhook again.
 Recovery performs no remote verification and creates no missing attempt, so idempotency and
 exactly-once delivery are not guaranteed. Detailed behavior is documented in [Database and
 migrations](docs/database.md), [Webhook delivery execution](docs/delivery-execution.md), and [API
 documentation](docs/api/index.md).
 
-The standalone bounded cycle and the one-shot bounded worker iteration are internal services and
-run only when called explicitly. Neither is a long-running worker process, background task,
-polling loop, scheduler, CLI, startup hook, or automatic retry executor, and neither invokes
-another iteration automatically.
+**Long-running worker process.** An operator starts the worker CLI separately from the API. The
+CLI creates `Settings`, a local engine and session factory, a shared HTTP client, and a shutdown
+Event. The framework-independent worker loop begins without an initial wait, then repeatedly
+derives one iteration timestamp and stale cutoff, invokes the one-shot worker iteration, and waits
+for the poll interval. `SIGINT` or supported `SIGTERM` requests graceful shutdown. Cleanup closes
+the client, restores handlers, and disposes the engine.
+
+The standalone bounded cycle and one-shot bounded worker iteration remain independently callable
+internal services. They do not schedule themselves or start from FastAPI. The worker loop supplies
+the repetition only while the separate process is explicitly running.
 
 ## Technology stack
 
@@ -346,6 +418,45 @@ python -m uvicorn reliable_webhook_service.main:app --reload
 
 See the [Development setup guide](docs/development.md) for environment configuration, PostgreSQL port conflicts, and local workflow details.
 
+## Worker configuration
+
+The API, worker CLI, Alembic, and tests read the same optional `.env` file through `Settings`.
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `DATABASE_URL` | Local PostgreSQL URL from `.env.example` | PostgreSQL connection used by the process |
+| `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` | `10.0` | Timeout for one outgoing HTTP request |
+| `WEBHOOK_DELIVERY_MAX_ATTEMPTS` | `5` | Total allowed attempts, including the first |
+| `WEBHOOK_DELIVERY_RETRY_BASE_SECONDS` | `5.0` | Exponential-backoff base delay |
+| `WEBHOOK_DELIVERY_RETRY_MAX_SECONDS` | `300.0` | Maximum retry delay |
+| `WEBHOOK_WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Wait between completed one-shot worker iterations |
+| `WEBHOOK_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS` | `300.0` | Age used to derive the stale recovery cutoff |
+| `WEBHOOK_WORKER_RECOVERY_LIMIT` | `100` | Maximum stale jobs recovered in one iteration |
+| `WEBHOOK_WORKER_PROCESSING_LIMIT` | `100` | Maximum due pending jobs claimed in one processing cycle |
+
+The first iteration has no preceding wait. Later successful iterations wait for the poll interval.
+For each iteration, `stale_before = iteration_at - stale-processing timeout`. Recovery and
+processing limits are independent. Time values must be positive and finite, limits must be
+positive integers, and Boolean values are not accepted as numbers.
+
+## Run the worker
+
+Ensure PostgreSQL is reachable and migrations are current, then use explicit operator invocation:
+
+```powershell
+python -m reliable_webhook_service.worker
+```
+
+The worker runs until graceful shutdown or a fatal error. It is not started by Uvicorn, FastAPI
+lifespan, or event creation. `POST /webhook-events` only persists an event and initial pending job;
+a running worker polls and claims due jobs in subsequent iterations. Run the API and worker in
+separate processes when both are needed.
+
+During shutdown, `SIGINT` or supported `SIGTERM` sets the stop Event. An active iteration finishes,
+no next iteration starts, the shared HTTP client closes, signal handlers are restored, and the
+local engine is disposed. A fatal iteration failure ends the process with code `1` and no
+worker-level retry; normal shutdown exits with code `0`.
+
 ## Available API
 
 | Method | Path | Purpose |
@@ -359,7 +470,7 @@ See the [Development setup guide](docs/development.md) for environment configura
 
 The pending job is a durable work item and is not included in the event response. Manual delivery
 remains explicit: `POST /webhook-events` does not invoke the delivery endpoint or execute HTTP
-automatically.
+inside the API request. An explicitly started worker process can later claim the due job.
 
 [API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md) | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md)
 
@@ -382,9 +493,9 @@ The full test suite and Alembic check require a running PostgreSQL service with 
 | Document | Description |
 |---|---|
 | [Documentation index](docs/index.md) | Main documentation portal |
-| [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, and quality checks |
-| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, claiming, recovery, bounded worker-iteration orchestration, and `SKIP LOCKED` transaction semantics |
-| [Webhook delivery execution](docs/delivery-execution.md) | Manual execution, the [bounded worker iteration](docs/delivery-execution.md#bounded-worker-iteration), standalone recovery and processing, partial progress, duplicate-delivery risk, transaction boundaries, and limitations |
+| [Development setup](docs/development.md) | Local installation, configuration, PostgreSQL startup, worker startup, and quality checks |
+| [Database and migrations](docs/database.md) | PostgreSQL configuration, Alembic, schema, atomic event and job persistence, worker resource ownership, claiming, recovery, bounded worker-iteration orchestration, and `SKIP LOCKED` transaction semantics |
+| [Webhook delivery execution](docs/delivery-execution.md) | The [long-running worker process](docs/delivery-execution.md#long-running-worker-process), manual execution, the [bounded worker iteration](docs/delivery-execution.md#bounded-worker-iteration), polling, graceful shutdown, recovery and processing, partial progress, duplicate-delivery risk, and transaction boundaries |
 | [API documentation](docs/api/index.md) | Available HTTP API and interactive documentation |
 | [Webhook endpoint API](docs/api/webhook-endpoints.md) | Endpoint creation, validation, listing, and status codes |
 | [Webhook event API](docs/api/webhook-events.md) | Event creation, validation, persistence, and error responses |

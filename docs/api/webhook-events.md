@@ -151,12 +151,13 @@ uncommitted records. The two flushes are not separate commits.
 
 An endpoint whose `is_active` value is `false` can still accept an event and receive a pending job.
 Because `next_attempt_at` represents the same instant as `event.created_at`, the job is immediately
-due. Nothing invokes `claim_due_webhook_delivery_jobs` automatically.
+due. The API request does not invoke `claim_due_webhook_delivery_jobs`.
 
 Creating the job does not send the payload to `target_url`, create a delivery attempt, invoke the
-claim service, apply retry policy, invoke the bounded worker iteration, or move the job to
-`processing`. See [Database and migrations](../database.md#atomic-event-and-delivery-job-creation)
-for transaction and persistence details.
+claim service, start the worker process or worker loop, invoke a one-shot worker iteration, perform
+recovery, apply retry policy, or move the job to `processing`. See
+[Database and migrations](../database.md#atomic-event-and-delivery-job-creation) for transaction
+and persistence details.
 
 ## Non-goals and current limitations
 
@@ -172,18 +173,17 @@ for transaction and persistence details.
   accepts a previously committed `processing` job, performs one completed delivery attempt,
   applies the retry policy, and flushes the attempt plus a `succeeded`, retryable `pending` with
   `next_attempt_at`, or `dead_letter` job transition in a caller-owned completion transaction.
-- The standalone bounded processing cycle and
-  [stale processing job recovery](../delivery-execution.md#stale-processing-job-recovery) remain
-  available for separate explicit internal invocation.
-- The internal
-  [bounded worker iteration](../delivery-execution.md#bounded-worker-iteration) explicitly
-  orchestrates one recovery phase followed by one processing cycle.
-- This endpoint invokes neither standalone service nor the bounded worker iteration. All require
-  explicit internal invocation.
-- The bounded worker iteration is one-shot. No long-running worker process, worker loop, polling,
-  scheduler, application-startup hook, automatic retry execution, or automatic iteration
-  invocation is implemented. Exactly-once delivery, idempotency, and replay are also not
-  implemented.
+- A separately and explicitly started
+  [long-running worker process](../delivery-execution.md#long-running-worker-process) polls for
+  work. In each one-shot worker iteration it performs stale recovery before processing and can
+  claim a due pending job, including a retry scheduled by an earlier iteration.
+- The API request does not start or invoke that worker process, its worker loop, an iteration,
+  recovery, or retry execution. FastAPI startup does not start it either; event creation and
+  delivery execution are separate lifecycles, not synchronous delivery within the request.
+- The API does not control the worker lifecycle and exposes no worker start, stop, or status
+  endpoint. Polling, due retry execution, and stale recovery run only while an operator has
+  explicitly started the separate worker process.
+- Exactly-once delivery, idempotency, and replay are not implemented.
 - No payload size limit is configured.
 - Authentication is not implemented.
 
