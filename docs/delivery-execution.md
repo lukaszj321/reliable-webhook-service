@@ -155,7 +155,7 @@ lower-level services continue to own their individual session boundaries.
 - parallel delivery completion;
 - configurable worker-level retry after a fatal iteration failure;
 - remote delivery verification;
-- idempotency or exactly-once delivery;
+- downstream delivery idempotency or exactly-once delivery;
 - manual replay.
 
 ## Bounded worker iteration
@@ -303,7 +303,8 @@ call makes eligible ones `pending`.
 
 External HTTP is not atomic with PostgreSQL. If a target receives a request before the completion
 transaction fails, later stale recovery and redelivery can duplicate that request. The iteration
-does not provide exactly-once delivery, idempotency, or remote-side deduplication.
+does not provide exactly-once delivery, downstream delivery idempotency, or remote-side
+deduplication.
 
 ### Still not implemented
 
@@ -312,7 +313,7 @@ does not provide exactly-once delivery, idempotency, or remote-side deduplicatio
 - leases, lease ownership, or heartbeat;
 - parallel job completion;
 - remote delivery verification;
-- exactly-once delivery, idempotency, or replay.
+- exactly-once delivery, downstream delivery idempotency, or manual replay.
 
 ## Bounded delivery processing cycle
 
@@ -443,7 +444,7 @@ external side effect. The bounded cycle therefore does not guarantee exactly-onc
 - execution without an explicitly running worker or other caller;
 - leases, lease owners, or heartbeat;
 - exactly-once delivery;
-- idempotency;
+- downstream delivery idempotency;
 - replay.
 
 ## Stale processing job recovery
@@ -552,8 +553,8 @@ A concrete failure sequence is:
 
 PostgreSQL does not know whether the remote target received the earlier request, and rollback
 cannot undo HTTP. Recovery performs no remote verification, creates no missing attempt, and
-performs no compensating action. The project has no idempotency key and provides no exactly-once
-guarantee.
+performs no compensating action. Event-ingestion idempotency does not forward its key to the
+target, so downstream delivery idempotency and exactly-once delivery are not provided.
 
 ### Cycle capabilities still not implemented
 
@@ -561,7 +562,7 @@ guarantee.
 - scheduler or application startup hook;
 - leases, lease owners, or heartbeat;
 - remote delivery verification;
-- idempotency;
+- downstream delivery idempotency;
 - exactly-once delivery;
 - replay.
 
@@ -921,7 +922,7 @@ lifecycle endpoint.
 - No exactly-once delivery
 - Recovery after a crash following external HTTP but before commit can cause duplicate delivery
 - No concurrent attempt-number allocation protection beyond the database unique constraint
-- No idempotency
+- No downstream delivery idempotency
 - No replay
 - No request signing
 - No custom headers
