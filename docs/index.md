@@ -2,10 +2,12 @@
 
 This documentation covers local development, PostgreSQL persistence, atomic event and initial job
 creation, delivery job claiming, manual webhook execution, internal atomic attempt-plus-job
-completion, the explicitly invoked bounded processing cycle, the one-shot
+completion, the explicitly started
+[long-running worker process](delivery-execution.md#long-running-worker-process), its
+framework-independent worker loop and one-shot
 [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), partial-progress
-semantics, retry scheduling and terminal transitions, explicit stale processing job recovery,
-its duplicate-delivery limitation, and the currently available HTTP API for Reliable Webhook
+semantics, retry scheduling and terminal transitions, stale processing job recovery, the
+duplicate remote delivery risk, and the currently available HTTP API for Reliable Webhook
 Delivery Service.
 
 ## Start here
@@ -24,17 +26,17 @@ Read the documentation in this order:
   migrations, atomic event and job transactions, the current schema, and delivery job claiming
   and recovery transaction semantics with `SKIP LOCKED`, including the separate recovery, claim,
   and per-job completion boundaries used by a bounded worker iteration.
-- [Webhook delivery execution](delivery-execution.md) — manual execution,
+- [Webhook delivery execution](delivery-execution.md) — the explicitly started long-running worker
+  process, environment-driven worker configuration, polling, graceful shutdown, manual execution,
   `execute_webhook_delivery_job`, the
   [bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle), separate
   claim and per-job completion transactions, partial progress, `succeeded`, `pending`, and
-  `dead_letter` transitions, and
-  [stale processing job recovery](delivery-execution.md#stale-processing-job-recovery). Recovery
-  is an explicit internal service rather than an automatic mechanism; the guide also explains the
-  [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), which explicitly
-  performs recovery-before-processing with independent limits and separate transactions. This
-  one-shot orchestration is not a long-running worker; partial progress and the duplicate-delivery
-  risk after an uncertain earlier HTTP result remain.
+  `dead_letter` transitions, due retry execution in later polls, and
+  [stale processing job recovery](delivery-execution.md#stale-processing-job-recovery). The guide
+  distinguishes the worker process and worker loop from the
+  [bounded worker iteration](delivery-execution.md#bounded-worker-iteration), which performs
+  recovery-before-processing with independent limits and separate transactions. Partial progress
+  and the duplicate remote delivery risk after an uncertain earlier HTTP result remain.
 - [API documentation](api/index.md) — health check, webhook endpoint, webhook event, and delivery
   attempt APIs.
 - [Webhook endpoint API](api/webhook-endpoints.md) — endpoint creation, request validation, and
@@ -52,6 +54,7 @@ Read the documentation in this order:
 - [Start PostgreSQL](development.md#start-postgresql)
 - [Apply database migrations](development.md#apply-database-migrations)
 - [Run the application](development.md#run-the-application)
+- [Run the long-running worker](development.md#run-the-worker)
 - [Run quality checks](development.md#quality-checks)
 - [Stop PostgreSQL](development.md#stop-postgresql)
 - [Review database connection configuration](database.md#connection-configuration)
@@ -62,6 +65,7 @@ Read the documentation in this order:
 - [Review claim transaction ownership](database.md#claim-transaction-ownership)
 - [Review SKIP LOCKED concurrency semantics](database.md#postgresql-locking)
 - [Review delivery execution flow](delivery-execution.md#current-execution-model)
+- [Review the long-running worker process](delivery-execution.md#long-running-worker-process)
 - [Review the bounded processing cycle](delivery-execution.md#bounded-delivery-processing-cycle)
 - [Review the bounded worker iteration](delivery-execution.md#bounded-worker-iteration)
 - [Review stale processing job recovery](delivery-execution.md#stale-processing-job-recovery)

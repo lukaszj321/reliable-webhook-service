@@ -1,6 +1,6 @@
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,31 @@ class Settings(BaseSettings):
         gt=0,
         allow_inf_nan=False,
     )
+    webhook_worker_poll_interval_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    webhook_worker_stale_processing_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    webhook_worker_recovery_limit: int = Field(default=100, ge=1)
+    webhook_worker_processing_limit: int = Field(default=100, ge=1)
+
+    @field_validator(
+        "webhook_worker_poll_interval_seconds",
+        "webhook_worker_stale_processing_timeout_seconds",
+        "webhook_worker_recovery_limit",
+        "webhook_worker_processing_limit",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_worker_settings(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("worker settings must not be booleans")
+        return value
 
     @model_validator(mode="after")
     def validate_webhook_delivery_retry_delays(self) -> Self:
