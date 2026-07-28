@@ -71,6 +71,7 @@ class _PersistedProcessingJob:
     job_id: uuid.UUID
     target_url: str
     payload: dict[str, JsonValue]
+    attempt_count: int
     next_attempt_at: datetime
     created_at: datetime
     updated_at: datetime
@@ -132,6 +133,7 @@ def _persist_processing_job(
     *,
     label: str,
     is_active: bool = True,
+    attempt_count: int = 0,
 ) -> _PersistedProcessingJob:
     endpoint_id = uuid.uuid4()
     event_id = uuid.uuid4()
@@ -174,6 +176,7 @@ def _persist_processing_job(
                 event_id=event_id,
                 status="processing",
                 next_attempt_at=next_attempt_at,
+                attempt_count=attempt_count,
                 created_at=created_at,
                 updated_at=updated_at,
             )
@@ -186,6 +189,7 @@ def _persist_processing_job(
         job_id=job_id,
         target_url=target_url,
         payload=payload,
+        attempt_count=attempt_count,
         next_attempt_at=next_attempt_at,
         created_at=created_at,
         updated_at=updated_at,
@@ -306,12 +310,14 @@ def test_successful_completion_is_invisible_before_commit_and_visible_after_comm
         assert result.attempt.outcome == "succeeded"
         assert job.status == "succeeded"
         assert job.next_attempt_at is None
+        assert job.attempt_count == 1
         assert _as_utc(job.updated_at) == expected_updated_at
 
         with SessionFactory() as observer_session:
             assert observer_session.get(WebhookDeliveryAttempt, result.attempt.id) is None
             observed_job = _get_job(observer_session, persisted.job_id)
             assert observed_job.status == "processing"
+            assert observed_job.attempt_count == 0
             assert observed_job.next_attempt_at is not None
             assert _as_utc(observed_job.next_attempt_at) == persisted.next_attempt_at
             assert _as_utc(observed_job.updated_at) == persisted.updated_at
@@ -327,6 +333,7 @@ def test_successful_completion_is_invisible_before_commit_and_visible_after_comm
         assert stored_attempt.attempt_number == 1
         assert stored_attempt.outcome == "succeeded"
         assert stored_job.status == "succeeded"
+        assert stored_job.attempt_count == 1
         assert stored_job.next_attempt_at is None
         assert _as_utc(stored_job.updated_at) == expected_updated_at
         assert verification_session.get(WebhookEndpoint, persisted.endpoint_id) is not None
@@ -373,6 +380,7 @@ def test_failed_completion_commits_exact_retry_schedule(
         assert stored_attempt.outcome == "failed"
         assert stored_attempt.response_status_code == 503
         assert stored_job.status == "pending"
+        assert stored_job.attempt_count == 1
         assert stored_job.next_attempt_at is not None
         assert _as_utc(stored_job.next_attempt_at) == expected_next_attempt_at
         assert _as_utc(stored_job.updated_at) == decision_at.astimezone(UTC)
@@ -383,7 +391,11 @@ def test_failed_completion_commits_exact_retry_schedule(
 def test_final_failed_completion_commits_dead_letter_transition(
     created_records: _CreatedRecords,
 ) -> None:
-    persisted = _persist_processing_job(created_records, label="dead-letter")
+    persisted = _persist_processing_job(
+        created_records,
+        label="dead-letter",
+        attempt_count=2,
+    )
     previous_attempt_ids = _seed_previous_attempts(
         created_records,
         persisted,
@@ -411,6 +423,7 @@ def test_final_failed_completion_commits_dead_letter_transition(
         assert result.attempt.attempt_number == 3
         assert result.attempt.outcome == "failed"
         assert result.attempt.response_status_code == 500
+        assert result.job.attempt_count == 3
         caller_session.commit()
         new_attempt_id = result.attempt.id
 
@@ -421,10 +434,91 @@ def test_final_failed_completion_commits_dead_letter_transition(
         assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3]
         assert {attempt.id for attempt in attempts} - set(previous_attempt_ids) == {new_attempt_id}
         assert stored_job.status == "dead_letter"
+        assert stored_job.attempt_count == 3
         assert stored_job.next_attempt_at is None
         assert _as_utc(stored_job.updated_at) == decision_at.astimezone(UTC)
 
     _assert_single_request(client, persisted)
+
+
+def test_manual_attempt_history_is_independent_from_worker_retry_cycle(
+    created_records: _CreatedRecords,
+) -> None:
+    persisted = _persist_processing_job(created_records, label="manual-history")
+    previous_attempt_ids = _seed_previous_attempts(
+        created_records,
+        persisted,
+        count=2,
+    )
+    first_decision_at = datetime(2026, 7, 27, 9, 6, tzinfo=UTC)
+    second_decision_at = datetime(2026, 7, 27, 9, 7, tzinfo=UTC)
+    client = _RecordingHttpClient(status_code=503)
+
+    with SessionFactory() as first_worker_session:
+        first_result = execute_webhook_delivery_job(
+            first_worker_session,
+            job_id=persisted.job_id,
+            http_client=client,
+            timeout_seconds=TIMEOUT_SECONDS,
+            max_attempts=3,
+            base_delay_seconds=BASE_DELAY_SECONDS,
+            max_delay_seconds=MAX_DELAY_SECONDS,
+            utc_now=lambda: datetime(2026, 7, 27, 9, 6, tzinfo=UTC),
+            decision_now=lambda: first_decision_at,
+            monotonic_ns=iter([4_000_000_000, 4_010_000_000]).__next__,
+        )
+        assert isinstance(first_result.attempt.id, uuid.UUID)
+        created_records.attempt_ids.append(first_result.attempt.id)
+        assert first_result.attempt.attempt_number == 3
+        assert first_result.job.attempt_count == 1
+        assert first_result.job.status == "pending"
+        assert first_result.job.next_attempt_at == first_decision_at + timedelta(seconds=5)
+        first_worker_session.commit()
+        first_worker_attempt_id = first_result.attempt.id
+
+    with SessionFactory() as claim_session:
+        claimed_job = _get_job(claim_session, persisted.job_id)
+        assert claimed_job.attempt_count == 1
+        claimed_job.status = "processing"
+        claimed_job.next_attempt_at = second_decision_at
+        claim_session.commit()
+
+    with SessionFactory() as second_worker_session:
+        second_result = execute_webhook_delivery_job(
+            second_worker_session,
+            job_id=persisted.job_id,
+            http_client=client,
+            timeout_seconds=TIMEOUT_SECONDS,
+            max_attempts=3,
+            base_delay_seconds=BASE_DELAY_SECONDS,
+            max_delay_seconds=MAX_DELAY_SECONDS,
+            utc_now=lambda: datetime(2026, 7, 27, 9, 7, tzinfo=UTC),
+            decision_now=lambda: second_decision_at,
+            monotonic_ns=iter([5_000_000_000, 5_010_000_000]).__next__,
+        )
+        assert isinstance(second_result.attempt.id, uuid.UUID)
+        created_records.attempt_ids.append(second_result.attempt.id)
+        assert second_result.attempt.attempt_number == 4
+        assert second_result.job.attempt_count == 2
+        assert second_result.job.status == "pending"
+        assert second_result.job.next_attempt_at == second_decision_at + timedelta(seconds=10)
+        second_worker_session.commit()
+        second_worker_attempt_id = second_result.attempt.id
+
+    with SessionFactory() as verification_session:
+        attempts = _attempts_for_event(verification_session, persisted.event_id)
+        stored_job = _get_job(verification_session, persisted.job_id)
+        assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3, 4]
+        assert {attempt.id for attempt in attempts} - set(previous_attempt_ids) == {
+            first_worker_attempt_id,
+            second_worker_attempt_id,
+        }
+        assert stored_job.attempt_count == 2
+        assert stored_job.status == "pending"
+        assert stored_job.next_attempt_at is not None
+        assert _as_utc(stored_job.next_attempt_at) == second_decision_at + timedelta(seconds=10)
+
+    assert len(client.requests) == 2
 
 
 def test_caller_rollback_removes_attempt_and_restores_processing_job(
@@ -453,10 +547,12 @@ def test_caller_rollback_removes_attempt_and_restores_processing_job(
         created_records.attempt_ids.append(attempt_id)
         assert caller_session.get(WebhookDeliveryAttempt, attempt_id) is result.attempt
         assert result.job.status == "succeeded"
+        assert result.job.attempt_count == 1
 
         with SessionFactory() as observer_session:
             assert observer_session.get(WebhookDeliveryAttempt, attempt_id) is None
             assert _get_job(observer_session, persisted.job_id).status == "processing"
+            assert _get_job(observer_session, persisted.job_id).attempt_count == 0
             observer_session.rollback()
 
         caller_session.rollback()
@@ -466,6 +562,7 @@ def test_caller_rollback_removes_attempt_and_restores_processing_job(
         assert _attempts_for_event(verification_session, persisted.event_id) == []
         stored_job = _get_job(verification_session, persisted.job_id)
         assert stored_job.status == "processing"
+        assert stored_job.attempt_count == 0
         assert stored_job.next_attempt_at is not None
         assert _as_utc(stored_job.next_attempt_at) == persisted.next_attempt_at
         assert _as_utc(stored_job.updated_at) == persisted.updated_at
@@ -510,6 +607,7 @@ def test_inactive_endpoint_error_leaves_processing_job_unchanged(
         assert client.requests == []
         assert _attempts_for_event(caller_session, persisted.event_id) == []
         assert job.status == "processing"
+        assert job.attempt_count == 0
         assert job.next_attempt_at is not None
         assert _as_utc(job.next_attempt_at) == persisted.next_attempt_at
         assert _as_utc(job.updated_at) == persisted.updated_at
@@ -519,6 +617,7 @@ def test_inactive_endpoint_error_leaves_processing_job_unchanged(
         assert _attempts_for_event(verification_session, persisted.event_id) == []
         stored_job = _get_job(verification_session, persisted.job_id)
         assert stored_job.status == "processing"
+        assert stored_job.attempt_count == 0
         assert stored_job.next_attempt_at is not None
         assert _as_utc(stored_job.next_attempt_at) == persisted.next_attempt_at
         assert _as_utc(stored_job.updated_at) == persisted.updated_at

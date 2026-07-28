@@ -27,7 +27,11 @@ BASE_DELAY_SECONDS = 5.0
 MAX_DELAY_SECONDS = 300.0
 
 
-def _job(*, status: str = "processing") -> WebhookDeliveryJob:
+def _job(
+    *,
+    status: str = "processing",
+    attempt_count: int = 0,
+) -> WebhookDeliveryJob:
     return WebhookDeliveryJob(
         id=JOB_ID,
         event_id=EVENT_ID,
@@ -35,6 +39,7 @@ def _job(*, status: str = "processing") -> WebhookDeliveryJob:
         next_attempt_at=(
             None if status in {"succeeded", "dead_letter"} else INITIAL_NEXT_ATTEMPT_AT
         ),
+        attempt_count=attempt_count,
         created_at=CREATED_AT,
         updated_at=INITIAL_UPDATED_AT,
     )
@@ -115,11 +120,12 @@ def _assert_retry_arguments(
     retry_mock: Mock,
     *,
     attempt: WebhookDeliveryAttempt,
+    cycle_attempt_number: int,
     decision_at: datetime,
 ) -> None:
     retry_mock.assert_called_once_with(
         outcome=attempt.outcome,
-        attempt_number=attempt.attempt_number,
+        attempt_number=cycle_attempt_number,
         decision_at=decision_at,
         max_attempts=MAX_ATTEMPTS,
         base_delay_seconds=BASE_DELAY_SECONDS,
@@ -137,6 +143,7 @@ def _job_values(job: WebhookDeliveryJob) -> tuple[object, ...]:
         job.event_id,
         job.status,
         job.next_attempt_at,
+        job.attempt_count,
         job.created_at,
         job.updated_at,
     )
@@ -240,10 +247,16 @@ def test_applies_succeeded_decision_and_returns_same_objects(
         utc_now=utc_now,
         monotonic_ns=monotonic_ns,
     )
-    _assert_retry_arguments(retry_mock, attempt=attempt, decision_at=decision_at)
+    _assert_retry_arguments(
+        retry_mock,
+        attempt=attempt,
+        cycle_attempt_number=1,
+        decision_at=decision_at,
+    )
     decision_now.assert_called_once_with()
     assert job.status == "succeeded"
     assert job.next_attempt_at is None
+    assert job.attempt_count == 1
     assert job.updated_at == decision_at
     assert (job.id, job.event_id, job.created_at) == original_identity_values
     session.flush.assert_called_once_with()
@@ -256,8 +269,8 @@ def test_applies_succeeded_decision_and_returns_same_objects(
 def test_applies_retryable_failure_decision_without_recalculating_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    job = _job()
-    attempt = _attempt(outcome="failed", attempt_number=2)
+    job = _job(attempt_count=1)
+    attempt = _attempt(outcome="failed", attempt_number=7)
     decision_at = datetime(2026, 7, 26, 9, 1, tzinfo=UTC)
     retry_at = datetime(2026, 7, 26, 9, 1, 10, tzinfo=UTC)
     session = _session_returning(job)
@@ -283,10 +296,16 @@ def test_applies_retryable_failure_decision_without_recalculating_timestamp(
         utc_now=utc_now,
         monotonic_ns=monotonic_ns,
     )
-    _assert_retry_arguments(retry_mock, attempt=attempt, decision_at=decision_at)
+    _assert_retry_arguments(
+        retry_mock,
+        attempt=attempt,
+        cycle_attempt_number=2,
+        decision_at=decision_at,
+    )
     decision_now.assert_called_once_with()
     assert job.status == "pending"
     assert job.next_attempt_at is retry_at
+    assert job.attempt_count == 2
     assert job.updated_at == decision_at
     session.flush.assert_called_once_with()
     session.add.assert_not_called()
@@ -298,8 +317,8 @@ def test_applies_retryable_failure_decision_without_recalculating_timestamp(
 def test_applies_dead_letter_decision_and_returns_same_objects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    job = _job()
-    attempt = _attempt(outcome="failed", attempt_number=MAX_ATTEMPTS)
+    job = _job(attempt_count=MAX_ATTEMPTS - 1)
+    attempt = _attempt(outcome="failed", attempt_number=MAX_ATTEMPTS + 3)
     decision_at = datetime(2026, 7, 26, 9, 2, tzinfo=UTC)
     session = _session_returning(job)
     execution_mock = Mock(return_value=attempt)
@@ -324,10 +343,16 @@ def test_applies_dead_letter_decision_and_returns_same_objects(
         utc_now=utc_now,
         monotonic_ns=monotonic_ns,
     )
-    _assert_retry_arguments(retry_mock, attempt=attempt, decision_at=decision_at)
+    _assert_retry_arguments(
+        retry_mock,
+        attempt=attempt,
+        cycle_attempt_number=MAX_ATTEMPTS,
+        decision_at=decision_at,
+    )
     decision_now.assert_called_once_with()
     assert job.status == "dead_letter"
     assert job.next_attempt_at is None
+    assert job.attempt_count == MAX_ATTEMPTS
     assert job.updated_at == decision_at
     session.flush.assert_called_once_with()
     session.add.assert_not_called()
@@ -372,9 +397,15 @@ def test_normalizes_decision_timestamp_to_utc_after_retry_decision(
         utc_now=utc_now,
         monotonic_ns=monotonic_ns,
     )
-    _assert_retry_arguments(retry_mock, attempt=attempt, decision_at=decision_at)
+    _assert_retry_arguments(
+        retry_mock,
+        attempt=attempt,
+        cycle_attempt_number=1,
+        decision_at=decision_at,
+    )
     decision_now.assert_called_once_with()
     assert retry_mock.call_args.kwargs["decision_at"] is decision_at
+    assert job.attempt_count == 1
     assert job.updated_at == datetime(2026, 7, 26, 9, 3, tzinfo=UTC)
     assert job.updated_at.tzinfo is UTC
     session.flush.assert_called_once_with()
@@ -455,7 +486,12 @@ def test_propagates_retry_policy_failure_without_job_mutation(
         utc_now=utc_now,
         monotonic_ns=monotonic_ns,
     )
-    _assert_retry_arguments(retry_mock, attempt=attempt, decision_at=decision_at)
+    _assert_retry_arguments(
+        retry_mock,
+        attempt=attempt,
+        cycle_attempt_number=1,
+        decision_at=decision_at,
+    )
     decision_now.assert_called_once_with()
     assert _job_values(job) == original_values
     session.flush.assert_not_called()
@@ -466,8 +502,8 @@ def test_propagates_retry_policy_failure_without_job_mutation(
 def test_propagates_job_flush_failure_after_preparing_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    job = _job()
-    attempt = _attempt(outcome="failed", attempt_number=2)
+    job = _job(attempt_count=1)
+    attempt = _attempt(outcome="failed", attempt_number=7)
     decision_at = datetime(2026, 7, 26, 9, 5, tzinfo=UTC)
     retry_at = datetime(2026, 7, 26, 9, 5, 10, tzinfo=UTC)
     session = _session_returning(job)
@@ -497,10 +533,16 @@ def test_propagates_job_flush_failure_after_preparing_transition(
         utc_now=utc_now,
         monotonic_ns=monotonic_ns,
     )
-    _assert_retry_arguments(retry_mock, attempt=attempt, decision_at=decision_at)
+    _assert_retry_arguments(
+        retry_mock,
+        attempt=attempt,
+        cycle_attempt_number=2,
+        decision_at=decision_at,
+    )
     decision_now.assert_called_once_with()
     assert job.status == "pending"
     assert job.next_attempt_at is retry_at
+    assert job.attempt_count == 2
     assert job.updated_at == decision_at
     session.flush.assert_called_once_with()
     session.add.assert_not_called()
