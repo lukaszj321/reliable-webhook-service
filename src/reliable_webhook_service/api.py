@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,11 @@ from reliable_webhook_service.dependencies import (
 from reliable_webhook_service.event_service import (
     WebhookEndpointNotFoundError as EventWebhookEndpointNotFoundError,
 )
-from reliable_webhook_service.event_service import create_webhook_event_with_delivery_job
+from reliable_webhook_service.event_service import (
+    WebhookEventIdempotencyConflictError,
+    WebhookIdempotencyKeyValidationError,
+    create_idempotent_webhook_event_with_delivery_job,
+)
 from reliable_webhook_service.models import (
     WebhookDeliveryAttempt,
     WebhookEndpoint,
@@ -34,6 +38,7 @@ from reliable_webhook_service.schemas import (
 )
 
 SessionDependency = Annotated[Session, Depends(get_session)]
+IdempotencyKeyHeader = Annotated[str | None, Header(alias="Idempotency-Key")]
 
 router = APIRouter(
     prefix="/webhook-endpoints",
@@ -83,27 +88,54 @@ def list_webhook_endpoints(
     "",
     response_model=WebhookEventResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_200_OK: {
+            "model": WebhookEventResponse,
+            "description": "Equivalent webhook event reused",
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "Idempotency key conflicts with an existing webhook event",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "Invalid request or idempotency key",
+        },
+    },
 )
 def create_webhook_event(
     payload: WebhookEventCreate,
+    response: Response,
     session: SessionDependency,
+    idempotency_key: IdempotencyKeyHeader = None,
 ) -> WebhookEvent:
     try:
-        event = create_webhook_event_with_delivery_job(
+        result = create_idempotent_webhook_event_with_delivery_job(
             session,
             endpoint_id=payload.endpoint_id,
             event_type=payload.event_type,
             payload=payload.payload,
+            idempotency_key=idempotency_key,
         )
     except EventWebhookEndpointNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(error),
         ) from error
+    except WebhookIdempotencyKeyValidationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        ) from error
+    except WebhookEventIdempotencyConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
 
     session.commit()
-    session.refresh(event)
-    return event
+    session.refresh(result.event)
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return result.event
 
 
 @webhook_event_router.get(
