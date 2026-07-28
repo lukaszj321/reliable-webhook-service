@@ -72,6 +72,13 @@ A FastAPI service being developed toward reliable webhook ingestion and delivery
 - Manual execution uses `execute_webhook_delivery` directly and does not update a
   `WebhookDeliveryJob`
 - HTTP 201 for both committed `succeeded` and `failed` delivery attempts
+- Public `POST /webhook-events/{event_id}/replay` endpoint accepts no body and returns HTTP 202
+  after atomically rescheduling an existing terminal (`succeeded` or `dead_letter`) job
+- Replay performs no outgoing HTTP and creates no event, job, or attempt. It resets the existing
+  job's automatic-cycle `attempt_count` to `0`, while preserving the global attempt history for
+  the worker to continue later
+- `pending` and `processing` jobs are not replayable; PostgreSQL `SELECT FOR UPDATE` ensures two
+  concurrent replay requests cannot both transition the same terminal job
 - Preparation errors occur before HTTP execution and before a delivery attempt is created
 - Internal, framework-independent `execute_webhook_delivery_job` validates an existing committed
   `processing` job and calls `execute_webhook_delivery` exactly once
@@ -173,7 +180,6 @@ The following capabilities are planned but are not currently implemented:
 - Idempotency-key expiration, deletion, or automatic cleanup
 - Exactly-once delivery
 - Direct delivery execution inside the event-creation API request
-- Manual replay
 
 ## Non-goals
 
@@ -227,6 +233,17 @@ flowchart LR
     Classification -->|"creates one completed attempt"| Attempt
     DeliverySession -->|"attempt add + flush through Execute"| Attempt
     AttemptPOST -->|"refresh after commit"| Attempt
+    App --> ReplayAPI["FastAPI<br/>POST /webhook-events/{event_id}/replay<br/>no body; 202 Accepted"]
+    ReplayAPI --> ReplayService["replay_webhook_event"]
+    ReplayService --> ReplayLookup["Load existing event<br/>and active endpoint"]
+    ReplayLookup --> ReplayLock["SELECT FOR UPDATE<br/>existing delivery job"]
+    ReplayLock --> ReplayEligibility{"succeeded or<br/>dead_letter?"}
+    ReplayEligibility -->|"yes"| ReplayTransition["Existing job to pending<br/>attempt_count = 0<br/>next_attempt_at = replayed_at"]
+    ReplayEligibility -->|"no"| ReplayConflict["409 Conflict"]
+    ReplayService --> ReplayNoIO["No HTTP<br/>no new attempt<br/>no new job"]
+    ReplayTransition --> ReplayCommit["Caller-owned commit"]
+    ReplayCommit --> Job
+    ReplayCommit -->|"normal due-job path"| ClaimService
     ExplicitCaller["Explicit standalone cycle caller<br/>no automatic invocation"]
     ExplicitCaller -->|"one bounded invocation"| Cycle["run_webhook_delivery_processing_cycle"]
     Cycle -->|"opens one dedicated session"| ClaimSession["Claim SQLAlchemy session"]
@@ -480,6 +497,7 @@ worker-level retry; normal shutdown exits with code `0`.
 | POST | `/webhook-endpoints` | Create a webhook endpoint configuration |
 | GET | `/webhook-endpoints` | List stored webhook endpoint configurations |
 | POST | `/webhook-events` | Create an event and pending job, optionally reusing an equivalent event through `Idempotency-Key` (`201`, `200`, `409`, or `422`) |
+| POST | `/webhook-events/{event_id}/replay` | Reschedule an existing terminal job with a fresh automatic retry budget (`202`, `404`, or `409`) |
 | POST | `/webhook-events/{event_id}/delivery-attempts` | Manually execute one synchronous delivery and return the persisted attempt |
 | GET | `/webhook-events/{event_id}/delivery-attempts` | List stored completed delivery attempts for one event |
 
@@ -489,6 +507,33 @@ reuse returns HTTP 409, and an invalid key returns HTTP 422. Both successful sta
 event-only response schema; the key and job are not returned. Manual delivery remains explicit:
 `POST /webhook-events` does not invoke the delivery endpoint or execute HTTP inside the API
 request. An explicitly started worker process can later claim the due job.
+
+Manual replay is asynchronous:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/webhook-events/00000000-0000-0000-0000-000000000001/replay
+```
+
+It accepts no body and no `Idempotency-Key`. A successful request returns HTTP 202:
+
+```json
+{
+  "event_id": "00000000-0000-0000-0000-000000000001",
+  "delivery_job_id": "00000000-0000-0000-0000-000000000002",
+  "status": "pending",
+  "next_attempt_at": "2026-07-30T12:00:00Z"
+}
+```
+
+HTTP 202 means that the existing job was accepted for later worker processing; it does not mean
+that downstream delivery succeeded. Missing events return 404. Missing or inactive endpoints,
+missing jobs, and `pending` or `processing` jobs return 409. Infrastructure failures are not
+translated into replay conflicts.
+
+Replay differs from synchronous manual delivery. Replay performs no HTTP, creates no attempt,
+resets only `WebhookDeliveryJob.attempt_count`, and schedules the existing job. The
+`delivery-attempts` POST performs HTTP immediately, creates one globally numbered attempt, returns
+201, and neither resets nor increments the job's cycle count.
 
 [API documentation](docs/api/index.md) | [Webhook endpoint API](docs/api/webhook-endpoints.md) | [Webhook event API](docs/api/webhook-events.md) | [Webhook delivery attempt API](docs/api/webhook-delivery-attempts.md)
 

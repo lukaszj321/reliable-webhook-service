@@ -75,11 +75,17 @@ python -m alembic check
 
 **Current head**
 
+- Revision ID: `c4f7a9e21b6d`
+- Description: `add delivery job attempt count`
+- Down revision: `9970fa5ecbab`
+
+**Previous revision**
+
 - Revision ID: `9970fa5ecbab`
 - Description: `add webhook event idempotency key`
 - Down revision: `200628ca5044`
 
-**Previous revision**
+**Delivery job revision**
 
 - Revision ID: `200628ca5044`
 - Description: `create webhook delivery jobs`
@@ -107,6 +113,17 @@ python -m alembic check
 Revision `9970fa5ecbab` adds only the nullable `idempotency_key` column and its scoped unique
 constraint. Existing events retain `NULL`; the migration performs no backfill. Its downgrade
 removes only the unique constraint and the column.
+
+Revision `c4f7a9e21b6d` adds `webhook_delivery_jobs.attempt_count`, backfills it with the number of
+existing attempts for each event, then applies `NOT NULL`, server default `0`, and
+`ck_webhook_delivery_jobs_attempt_count_non_negative`. Its downgrade removes that constraint and
+column.
+
+The backfill has a one-time compatibility limitation: historical attempts do not record whether
+they came from the worker or the synchronous manual endpoint, so the previous automatic-cycle
+count cannot be reconstructed exactly. Counting all existing attempts preserves the pre-migration
+retry-budget behavior conservatively. After migration, manual delivery no longer changes
+`attempt_count`.
 
 ## Database schema
 
@@ -176,7 +193,7 @@ An internal one-shot bounded worker iteration can explicitly orchestrate one rec
 then one processing cycle. The explicitly started long-running worker process repeatedly invokes
 that iteration. A scheduled `pending` retry records eligibility for a later poll, and stale
 recovery runs before processing in every worker iteration. API startup does not start this
-process, and replay is not implemented.
+process. Manual replay only reschedules the existing job for that worker path.
 
 | Column | PostgreSQL type | Nullable | Default | Description |
 |---|---|---:|---|---|
@@ -184,6 +201,7 @@ process, and replay is not implemented.
 | `event_id` | `UUID` | No | None | Foreign key to `webhook_events.id` |
 | `status` | `VARCHAR(32)` | No | None | Processing state: `pending`, `processing`, `succeeded`, or `dead_letter` |
 | `next_attempt_at` | `TIMESTAMP WITH TIME ZONE` | Yes | None | Scheduled processing timestamp for non-terminal states |
+| `attempt_count` | `INTEGER` | No | `0` | Completed worker attempts in the current automatic cycle |
 | `created_at` | `TIMESTAMP WITH TIME ZONE` | No | `now()` | Creation timestamp |
 | `updated_at` | `TIMESTAMP WITH TIME ZONE` | No | `now()` | Initial or stored update timestamp |
 
@@ -196,6 +214,7 @@ process, and replay is not implemented.
   `dead_letter`.
 - `ck_webhook_delivery_jobs_status_next_attempt_at` requires `next_attempt_at IS NOT NULL` for
   `pending` and `processing`, and `next_attempt_at IS NULL` for `succeeded` and `dead_letter`.
+- `ck_webhook_delivery_jobs_attempt_count_non_negative` enforces `attempt_count >= 0`.
 - No separate application index named `ix_webhook_delivery_jobs_event_id` exists. PostgreSQL can
   maintain an index that supports the unique constraint, but it is not a separate application
   index.
@@ -220,6 +239,13 @@ they do not provide this orchestration. The one-shot bounded worker iteration pr
 recovery-before-processing orchestration. The separately started long-running worker polls
 `next_attempt_at` through successive processing cycles and invokes recovery before each one.
 Database constraints do not start either behavior.
+
+Manual replay uses the same job row. `replay_webhook_event` locks it through
+`SELECT ... FOR UPDATE`, accepts only terminal states, changes it to `pending`, resets
+`attempt_count` to `0`, and preserves every existing attempt. The service flushes and the API route
+commits. If two replay transactions race, the second waits for the row lock and, after the first
+commit, sees `pending` and is rejected. No Redis lock, process-local lock, serializable isolation,
+or replay idempotency key is used.
 
 ### webhook_delivery_attempts
 

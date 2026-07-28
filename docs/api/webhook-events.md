@@ -15,6 +15,7 @@ the webhook.
 - [Conflict response](#conflict-response)
 - [Validation and error responses](#validation-and-error-responses)
 - [Persistence behavior](#persistence-behavior)
+- [Manual replay](#manual-replay)
 - [Non-goals and current limitations](#non-goals-and-current-limitations)
 - [Navigation](#navigation)
 
@@ -241,6 +242,61 @@ recovery, apply retry policy, or move the job to `processing`. See
 [Database and migrations](../database.md#atomic-event-and-delivery-job-creation) for transaction
 and persistence details.
 
+## Manual replay
+
+```text
+POST /webhook-events/{event_id}/replay
+```
+
+The replay request has no body and does not accept `Idempotency-Key`. That header applies only to
+event ingestion; replay intentionally schedules another delivery cycle for an existing event.
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/webhook-events/00000000-0000-0000-0000-000000000001/replay
+```
+
+Only jobs in `succeeded` or `dead_letter` are eligible. A successful request returns HTTP 202:
+
+```json
+{
+  "event_id": "00000000-0000-0000-0000-000000000001",
+  "delivery_job_id": "00000000-0000-0000-0000-000000000002",
+  "status": "pending",
+  "next_attempt_at": "2026-07-30T12:00:00Z"
+}
+```
+
+HTTP 202 means the existing job is due for asynchronous worker processing. The request performs no
+downstream HTTP, creates no attempt, and creates neither a new event nor a new job. It resets
+`WebhookDeliveryJob.attempt_count` to `0`; the global
+`WebhookDeliveryAttempt.attempt_number` history is preserved.
+
+Errors are:
+
+| Condition | HTTP status |
+|---|---:|
+| Event does not exist | 404 |
+| Endpoint does not exist or is inactive | 409 |
+| Delivery job does not exist | 409 |
+| Job is already `pending` or `processing` | 409 |
+
+Infrastructure errors are not mapped to 409. The service locks the existing job through
+`SELECT ... FOR UPDATE`, flushes the transition, and leaves commit to the API route. If two replay
+requests race, the second waits for the row lock, sees `pending` after the first commit, and
+receives deterministic HTTP 409.
+
+Replay differs from `POST /webhook-events/{event_id}/delivery-attempts`: that endpoint performs one
+synchronous HTTP request, stores one global attempt, returns HTTP 201, and does not update
+`attempt_count` or schedule worker work.
+
+Replay does not guarantee exactly-once delivery. A previous request may have reached downstream
+before a local timeout or failure, so replay can duplicate remote side effects. Downstream systems
+should use their own idempotency or deduplication where needed.
+
+Authentication and authorization are not implemented. Production deployments should normally
+restrict replay to authorized operators. The replay response contains no payload, idempotency key,
+stored response body, or authorization data; replay paths should not log payloads.
+
 ## Non-goals and current limitations
 
 - General event listing through `GET /webhook-events` is not available. The only read operation
@@ -270,8 +326,6 @@ and persistence details.
   cannot guarantee target-side deduplication.
 - Exactly-once delivery is not implemented. HTTP may reach the target before a completion
   transaction fails, allowing recovery and later processing to deliver again.
-- Manual replay is not implemented. The manual delivery endpoint performs a new synchronous
-  attempt; it does not reset a job, restore a dead-letter job, or implement a replay lifecycle.
 - Idempotency keys have no expiration, deletion endpoint, or automatic cleanup.
 - No payload size limit is configured.
 - Authentication is not implemented.

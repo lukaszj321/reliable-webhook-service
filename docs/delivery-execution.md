@@ -1,6 +1,6 @@
 # Webhook Delivery Execution
 
-Delivery execution and recovery have seven related entry points. `execute_webhook_delivery` performs
+Delivery execution, recovery, and replay have eight related entry points. `execute_webhook_delivery` performs
 one HTTP attempt and flushes one completed `WebhookDeliveryAttempt` in a caller-owned transaction.
 The internal `execute_webhook_delivery_job` service accepts a previously committed `processing`
 job, uses that execution service, applies one retry decision, and flushes the job transition in
@@ -11,6 +11,8 @@ returns one bounded batch of stale `processing` jobs to `pending` without HTTP o
 processing phase. The long-running worker loop repeatedly invokes that one-shot iteration after
 explicit operator startup through the worker CLI. The public manual endpoint uses only
 `execute_webhook_delivery`, commits the attempt, and does not update a delivery job.
+The public replay endpoint uses `replay_webhook_event` to reschedule an existing terminal job
+without HTTP or attempt creation.
 
 ## Contents
 
@@ -28,6 +30,7 @@ explicit operator startup through the worker CLI. The public manual endpoint use
 - [Retry decision policy](#retry-decision-policy)
 - [Delivery job completion](#delivery-job-completion)
 - [Delivery job claiming](#delivery-job-claiming)
+- [Manual replay and retry-cycle budget](#manual-replay-and-retry-cycle-budget)
 - [Error handling](#error-handling)
 - [Invocation](#invocation)
 - [Current limitations](#current-limitations)
@@ -155,8 +158,7 @@ lower-level services continue to own their individual session boundaries.
 - parallel delivery completion;
 - configurable worker-level retry after a fatal iteration failure;
 - remote delivery verification;
-- downstream delivery idempotency or exactly-once delivery;
-- manual replay.
+- downstream delivery idempotency or exactly-once delivery.
 
 ## Bounded worker iteration
 
@@ -313,7 +315,7 @@ deduplication.
 - leases, lease ownership, or heartbeat;
 - parallel job completion;
 - remote delivery verification;
-- exactly-once delivery, downstream delivery idempotency, or manual replay.
+- exactly-once delivery or downstream delivery idempotency.
 
 ## Bounded delivery processing cycle
 
@@ -684,7 +686,8 @@ Concurrent attempt-number allocation remains outside the current scope.
 
 The retry decision policy remains pure and separate from `execute_webhook_delivery`, which
 continues to execute exactly one HTTP request. After an attempt is complete, the policy accepts its
-`outcome`, `attempt_number`, an explicit timezone-aware `decision_at`, and the retry settings. It
+`outcome`, the current cycle attempt number (`job.attempt_count + 1`), an explicit timezone-aware
+`decision_at`, and the retry settings. It
 does not perform HTTP, read the system time, write to PostgreSQL, or update
 `WebhookDeliveryJob` itself.
 
@@ -696,10 +699,10 @@ The policy returns an immutable `RetryDecision` containing `status` and `next_at
 | `failed` and `attempt_number < max_attempts` | `pending` | `decision_at` normalized to UTC plus the retry delay |
 | `failed` and `attempt_number >= max_attempts` | `dead_letter` | `null` |
 
-`max_attempts` is the total allowed number of attempts, including the first. Treating attempt
-numbers above the limit as `dead_letter` also handles configurations lowered after earlier attempts
-were recorded. `processing` remains a possible `WebhookDeliveryJob` state, but it is not a retry
-decision status.
+`max_attempts` is the total worker-attempt budget for the current automatic cycle, including the
+first. Global attempt numbers may be higher because they span earlier cycles and synchronous
+manual deliveries. `processing` remains a possible `WebhookDeliveryJob` state, but it is not a
+retry decision status.
 
 The exponential-backoff delay is:
 
@@ -742,16 +745,17 @@ The internal service performs this sequence:
 
 1. load `WebhookDeliveryJob` with `session.get`;
 2. validate that its status is `processing`;
-3. call `execute_webhook_delivery` exactly once;
-4. let that service add and flush one completed attempt;
-5. obtain the decision timestamp;
-6. call `decide_webhook_retry` exactly once;
-7. assign `job.status` from the decision;
-8. assign `job.next_attempt_at` from the decision;
-9. set `job.updated_at` to the decision instant normalized to UTC;
-10. flush the job transition;
-11. return `WebhookDeliveryJobExecutionResult`;
-12. leave commit or rollback to the caller.
+3. compute the cycle attempt number as `job.attempt_count + 1`;
+4. call `execute_webhook_delivery` exactly once;
+5. let that service add and flush one completed attempt;
+6. obtain the decision timestamp;
+7. call `decide_webhook_retry` exactly once with the cycle attempt number;
+8. assign the cycle attempt number to `job.attempt_count`;
+9. assign `job.status` and `job.next_attempt_at` from the decision;
+10. set `job.updated_at` to the decision instant normalized to UTC;
+11. flush the job transition;
+12. return `WebhookDeliveryJobExecutionResult`;
+13. leave commit or rollback to the caller.
 
 The result contains exactly the existing `job` and the new `attempt`.
 
@@ -831,6 +835,53 @@ The claim service does not invoke completion, and completion does not invoke cla
 bounded cycle connects those operations, the one-shot worker iteration invokes that cycle, and
 the explicitly started long-running worker loop invokes successive iterations. The claim
 transaction therefore does not retain row locks during the external HTTP request.
+
+## Manual replay and retry-cycle budget
+
+`POST /webhook-events/{event_id}/replay` reschedules the existing terminal job. The replay service
+locks it with `SELECT ... FOR UPDATE`, accepts only `succeeded` or `dead_letter`, changes it to
+`pending`, resets `attempt_count` to `0`, and schedules `next_attempt_at` at the replay timestamp.
+The service flushes; the API owns the commit. Replay itself performs no HTTP and creates no
+attempt.
+
+Two counters intentionally differ:
+
+- `WebhookDeliveryAttempt.attempt_number` is the global audit sequence for the event. It grows
+  across worker attempts, synchronous manual deliveries, and all replay cycles, and replay never
+  resets it.
+- `WebhookDeliveryJob.attempt_count` counts completed worker attempts in the current automatic
+  cycle. New jobs start at `0`, worker completion increments it, replay resets it to `0`, and
+  synchronous manual delivery leaves it unchanged. Retry decisions use `attempt_count + 1`.
+
+Example:
+
+```text
+Original cycle:
+global attempts 1-5
+job.attempt_count = 5
+status = dead_letter
+
+Replay:
+job.attempt_count = 0
+status = pending
+
+First replay worker attempt:
+global attempt = 6
+cycle attempt = 1
+```
+
+After replay, the normal worker path claims the due job. `execute_webhook_delivery_job` stores the
+next global attempt, obtains a retry decision from the cycle number, and flushes the attempt,
+`attempt_count`, status, schedule, and `updated_at` in one caller-owned transaction.
+
+Replay and synchronous manual delivery are separate operations. The replay route returns 202 and
+only schedules worker work. The `delivery-attempts` POST performs HTTP immediately, stores one
+global attempt, returns 201, and neither schedules the job nor changes its cycle count.
+
+Replay can duplicate downstream side effects when an earlier delivery reached the target before a
+local timeout or transaction failure. It does not provide exactly-once delivery; operators should
+replay deliberately, and downstream systems should implement idempotency or deduplication when
+required.
 
 ## Error handling
 
@@ -923,7 +974,6 @@ lifecycle endpoint.
 - Recovery after a crash following external HTTP but before commit can cause duplicate delivery
 - No concurrent attempt-number allocation protection beyond the database unique constraint
 - No downstream delivery idempotency
-- No replay
 - No request signing
 - No custom headers
 - No response body persistence

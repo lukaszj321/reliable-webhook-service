@@ -9,6 +9,8 @@ framework-independent worker loop and one-shot
 semantics, retry scheduling and terminal transitions, stale processing job recovery, the
 duplicate remote delivery risk, and the currently available HTTP API for Reliable Webhook
 Delivery Service.
+It also covers terminal-job manual replay with a fresh automatic retry budget and preserved global
+attempt history.
 
 ## Start here
 
@@ -44,7 +46,8 @@ Read the documentation in this order:
   listing behavior.
 - [Webhook event API](api/webhook-events.md) — optional endpoint-scoped `Idempotency-Key`, event
   validation, `201` creation, `200` equivalent reuse, conflict handling, atomic event and pending
-  job persistence, and the unchanged event-only response.
+  job persistence, the unchanged event-only response, and asynchronous terminal-job
+  [manual replay](api/webhook-events.md#manual-replay).
 - [Webhook delivery attempt API](api/webhook-delivery-attempts.md) — manual execution with `POST`,
   including the manual route commit and unchanged completed-attempt response, plus read-only
   listing with `GET`, outcomes, ordering, and error responses.
@@ -86,6 +89,7 @@ Read the documentation in this order:
 - [Review idempotent event ingestion](api/webhook-events.md#optional-idempotency-header)
 - [Review webhook event status and error behavior](api/webhook-events.md#validation-and-error-responses)
 - [Review webhook event persistence behavior](api/webhook-events.md#persistence-behavior)
+- [Replay a terminal webhook event](api/webhook-events.md#manual-replay)
 - [Review idempotency persistence and concurrency](database.md#atomic-event-and-delivery-job-creation)
 - [Manually execute one webhook delivery](api/webhook-delivery-attempts.md#manual-delivery-endpoint)
 - [List delivery attempts](api/webhook-delivery-attempts.md#listing-endpoint)
