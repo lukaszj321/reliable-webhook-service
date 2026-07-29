@@ -9,7 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import SessionFactory
-from reliable_webhook_service.delivery_http import Httpx2WebhookHttpClient
+from reliable_webhook_service.delivery_http import (
+    Httpx2WebhookHttpClient,
+    WebhookHttpResponse,
+)
 from reliable_webhook_service.delivery_service import (
     InactiveWebhookEndpointError,
     WebhookEventNotFoundError,
@@ -565,6 +568,71 @@ def test_execute_delivery_uses_non_negative_duration() -> None:
     finally:
         _cleanup_records(
             attempt_ids=attempt_ids,
+            event_ids=[event_id],
+            endpoint_ids=[endpoint_id],
+        )
+
+
+@pytest.mark.parametrize(
+    "raised_error",
+    [
+        RuntimeError("unexpected runtime failure"),
+        ValueError("unexpected value failure"),
+    ],
+    ids=["runtime-error", "value-error"],
+)
+def test_execute_delivery_propagates_non_transport_error_without_attempt(
+    raised_error: Exception,
+) -> None:
+    marker = uuid.uuid4()
+    endpoint_id = uuid.uuid4()
+    event_id = uuid.uuid4()
+
+    class RaisingHttpClient:
+        def post_json(
+            self,
+            *,
+            target_url: str,
+            payload: dict[str, JsonValue],
+            timeout_seconds: float,
+        ) -> WebhookHttpResponse:
+            raise raised_error
+
+    try:
+        _persist_endpoint_and_event(
+            endpoint_id=endpoint_id,
+            event_id=event_id,
+            marker=marker,
+            target_url=f"https://example.test/delivery-execution/{marker}/non-transport-error",
+            payload={"marker": str(marker), "scenario": "non-transport-error"},
+        )
+
+        with SessionFactory() as session:
+            with pytest.raises(type(raised_error)) as error_info:
+                execute_webhook_delivery(
+                    session,
+                    event_id=event_id,
+                    http_client=RaisingHttpClient(),
+                    timeout_seconds=5.0,
+                    utc_now=lambda: datetime(2026, 7, 25, 10, 8, tzinfo=UTC),
+                    monotonic_ns=iter([1_000_000_000]).__next__,
+                )
+
+            assert error_info.value is raised_error
+            assert (
+                list(
+                    session.scalars(
+                        select(WebhookDeliveryAttempt).where(
+                            WebhookDeliveryAttempt.event_id == event_id
+                        )
+                    ).all()
+                )
+                == []
+            )
+            assert _attempt_ids_for_event(event_id) == []
+    finally:
+        _cleanup_records(
+            attempt_ids=[],
             event_ids=[event_id],
             endpoint_ids=[endpoint_id],
         )

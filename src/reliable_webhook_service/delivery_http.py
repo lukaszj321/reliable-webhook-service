@@ -10,7 +10,19 @@ __all__ = [
     "Httpx2WebhookHttpClient",
     "WebhookHttpClient",
     "WebhookHttpResponse",
+    "WebhookTimeoutError",
+    "WebhookTransportError",
 ]
+
+
+class WebhookTransportError(RuntimeError):
+    def __init__(self, *, error_type_name: str) -> None:
+        self.error_type_name = error_type_name
+        super().__init__(f"Webhook transport failed: {error_type_name}")
+
+
+class WebhookTimeoutError(WebhookTransportError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +54,15 @@ class Httpx2WebhookHttpClient:
         if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
             raise ValueError("timeout_seconds must be a finite positive number")
 
-        response = self._client.post(
-            target_url,
-            json=payload,
-            timeout=timeout_seconds,
-            follow_redirects=False,
-        )
+        try:
+            response = self._client.post(
+                target_url,
+                json=payload,
+                timeout=timeout_seconds,
+                follow_redirects=False,
+            )
+        except httpx2.TimeoutException as error:
+            raise WebhookTimeoutError(error_type_name=type(error).__name__) from error
+        except httpx2.RequestError as error:
+            raise WebhookTransportError(error_type_name=type(error).__name__) from error
         return WebhookHttpResponse(status_code=response.status_code)

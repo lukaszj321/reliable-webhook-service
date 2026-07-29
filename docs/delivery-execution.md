@@ -602,7 +602,7 @@ response body.
 | HTTP 200-299 | `succeeded` | Actual response status | `null` |
 | Other HTTP status | `failed` | Actual response status | `HTTP response returned status {status_code}` |
 | Timeout | `failed` | `null` | `Webhook request timed out` |
-| Other `RequestError` | `failed` | `null` | `Webhook request failed: {ExceptionClassName}` |
+| Other `WebhookTransportError` | `failed` | `null` | `Webhook request failed: {ExceptionClassName}` |
 
 Exception text, response bodies, and tracebacks are not persisted.
 

@@ -4,11 +4,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-import httpx2
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from reliable_webhook_service.delivery_http import WebhookHttpClient
+from reliable_webhook_service.delivery_http import (
+    WebhookHttpClient,
+    WebhookTimeoutError,
+    WebhookTransportError,
+)
 from reliable_webhook_service.models import (
     JsonValue,
     WebhookDeliveryAttempt,
@@ -110,14 +113,16 @@ def execute_webhook_delivery(
             payload=prepared.payload,
             timeout_seconds=timeout_seconds,
         )
-    except httpx2.RequestError as error:
+    except WebhookTimeoutError:
         finished_ns = monotonic_ns()
         outcome = "failed"
         response_status_code = None
-        if isinstance(error, httpx2.TimeoutException):
-            error_message = "Webhook request timed out"
-        else:
-            error_message = f"Webhook request failed: {type(error).__name__}"
+        error_message = "Webhook request timed out"
+    except WebhookTransportError as error:
+        finished_ns = monotonic_ns()
+        outcome = "failed"
+        response_status_code = None
+        error_message = f"Webhook request failed: {error.error_type_name}"
     else:
         finished_ns = monotonic_ns()
         response_status_code = response.status_code

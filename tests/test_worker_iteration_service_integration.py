@@ -4,12 +4,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 
+import httpx2
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from reliable_webhook_service.database import SessionFactory
-from reliable_webhook_service.delivery_http import WebhookHttpResponse
+from reliable_webhook_service.delivery_http import (
+    Httpx2WebhookHttpClient,
+    WebhookHttpClient,
+    WebhookHttpResponse,
+)
 from reliable_webhook_service.delivery_service import InactiveWebhookEndpointError
 from reliable_webhook_service.models import (
     JsonValue,
@@ -217,7 +222,7 @@ def _persist_job(
 
 def _run_iteration(
     *,
-    client: _FakeHttpClient,
+    client: WebhookHttpClient,
     iteration_at: datetime,
     stale_before: datetime,
     recovery_limit: int,
@@ -241,6 +246,68 @@ def _run_iteration(
         decision_now=lambda: decision_at,
         monotonic_ns=monotonic_values.__next__,
     )
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_error_message"),
+    [
+        (httpx2.ReadTimeout, "Webhook request timed out"),
+        (httpx2.ConnectError, "Webhook request failed: ConnectError"),
+    ],
+)
+def test_worker_iteration_commits_transport_failure_and_schedules_retry(
+    error_type: type[httpx2.RequestError],
+    expected_error_message: str,
+) -> None:
+    with _isolated_records() as records:
+        iteration_at = datetime(2026, 8, 1, 13, 30, tzinfo=UTC)
+        decision_at = iteration_at + timedelta(minutes=2)
+        expected_next_attempt_at = decision_at + timedelta(seconds=BASE_DELAY_SECONDS)
+        persisted = _persist_job(
+            records,
+            label=error_type.__name__.lower(),
+            status="pending",
+            next_attempt_at=iteration_at - timedelta(minutes=1),
+            created_at=iteration_at - timedelta(hours=1),
+            updated_at=iteration_at - timedelta(minutes=2),
+        )
+        private_marker = f"private-transport-details-{uuid.uuid4()}"
+        requested_urls: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            requested_urls.append(str(request.url))
+            raise error_type(private_marker, request=request)
+
+        transport = httpx2.MockTransport(handler)
+        with httpx2.Client(transport=transport) as raw_client:
+            result = _run_iteration(
+                client=Httpx2WebhookHttpClient(raw_client),
+                iteration_at=iteration_at,
+                stale_before=iteration_at - timedelta(hours=1),
+                recovery_limit=1,
+                processing_limit=1,
+                attempted_at=iteration_at + timedelta(minutes=1),
+                decision_at=decision_at,
+            )
+
+        assert result.recovered_count == 0
+        assert result.processing.claimed_job_ids == (persisted.job_id,)
+        assert result.completed_count == 1
+        assert result.processing.completed_jobs[0].status == "pending"
+        assert requested_urls == [persisted.target_url]
+
+        with SessionFactory() as verification_session:
+            job = _get_job(verification_session, persisted.job_id)
+            attempts = _attempts_for_event(verification_session, persisted.event_id)
+            assert job.status == "pending"
+            assert job.attempt_count == 1
+            assert job.next_attempt_at is not None
+            assert _as_utc(job.next_attempt_at) == expected_next_attempt_at
+            assert len(attempts) == 1
+            assert attempts[0].outcome == "failed"
+            assert attempts[0].response_status_code is None
+            assert attempts[0].error_message == expected_error_message
+            assert private_marker not in attempts[0].error_message
 
 
 def _get_job(session: Session, job_id: uuid.UUID) -> WebhookDeliveryJob:

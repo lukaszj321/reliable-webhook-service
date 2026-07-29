@@ -6,6 +6,8 @@ import pytest
 from reliable_webhook_service.delivery_http import (
     Httpx2WebhookHttpClient,
     WebhookHttpResponse,
+    WebhookTimeoutError,
+    WebhookTransportError,
 )
 
 
@@ -130,3 +132,46 @@ def test_http_client_rejects_invalid_timeout_before_request(
             )
 
     assert request_count == 0
+
+
+def test_http_client_translates_read_timeout_without_exposing_details() -> None:
+    private_error = "private timeout details"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ReadTimeout(private_error, request=request)
+
+    transport = httpx2.MockTransport(handler)
+    with httpx2.Client(transport=transport) as client:
+        webhook_client = Httpx2WebhookHttpClient(client)
+        with pytest.raises(WebhookTimeoutError) as captured:
+            webhook_client.post_json(
+                target_url="https://example.test/webhooks/timeout",
+                payload={"event": "order.created"},
+                timeout_seconds=5.0,
+            )
+
+    assert captured.value.error_type_name == "ReadTimeout"
+    assert private_error not in str(captured.value)
+    assert isinstance(captured.value.__cause__, httpx2.ReadTimeout)
+
+
+def test_http_client_translates_connect_error_without_exposing_details() -> None:
+    private_error = "private connection details"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError(private_error, request=request)
+
+    transport = httpx2.MockTransport(handler)
+    with httpx2.Client(transport=transport) as client:
+        webhook_client = Httpx2WebhookHttpClient(client)
+        with pytest.raises(WebhookTransportError) as captured:
+            webhook_client.post_json(
+                target_url="https://example.test/webhooks/connect-error",
+                payload={"event": "order.created"},
+                timeout_seconds=5.0,
+            )
+
+    assert type(captured.value) is WebhookTransportError
+    assert captured.value.error_type_name == "ConnectError"
+    assert private_error not in str(captured.value)
+    assert isinstance(captured.value.__cause__, httpx2.ConnectError)
