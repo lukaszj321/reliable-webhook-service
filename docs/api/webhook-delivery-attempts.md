@@ -130,6 +130,9 @@ mean that the webhook was delivered successfully.
 An expected delivery failure is not an API failure: the endpoint returns HTTP 201 after persisting
 the failed attempt. A non-2xx response body is neither returned nor stored. Timeout and transport
 errors do not have an HTTP response status. Exception details and tracebacks are not exposed.
+The stored exception class name is a 1-64 character ASCII identifier that starts with a letter and
+otherwise contains only letters, digits, or `_`; invalid transport identifiers are rejected before
+persistence. Unexpected non-transport errors propagate instead of being converted into attempts.
 
 ## Manual delivery errors
 

@@ -1,4 +1,5 @@
 import math
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -14,9 +15,23 @@ __all__ = [
     "WebhookTransportError",
 ]
 
+_ERROR_TYPE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+
 
 class WebhookTransportError(RuntimeError):
+    """Expected transport failure with a safe, stable exception-class identifier.
+
+    ``error_type_name`` is limited to 1-64 ASCII characters. It must start with an
+    ASCII letter and may otherwise contain only ASCII letters, digits, and underscores.
+    """
+
     def __init__(self, *, error_type_name: str) -> None:
+        if not isinstance(error_type_name, str):
+            raise TypeError("error_type_name must be a string")
+        if _ERROR_TYPE_NAME_PATTERN.fullmatch(error_type_name) is None:
+            raise ValueError(
+                "error_type_name must be a 1-64 character ASCII identifier starting with a letter"
+            )
         self.error_type_name = error_type_name
         super().__init__(f"Webhook transport failed: {error_type_name}")
 
@@ -37,7 +52,14 @@ class WebhookHttpClient(Protocol):
         target_url: str,
         payload: dict[str, JsonValue],
         timeout_seconds: float,
-    ) -> WebhookHttpResponse: ...
+    ) -> WebhookHttpResponse:
+        """Send JSON or raise a normalized expected transport failure.
+
+        Implementations raise ``WebhookTimeoutError`` for transport timeouts and
+        ``WebhookTransportError`` for other expected transport failures. Unexpected
+        programming or contract errors propagate unchanged.
+        """
+        ...
 
 
 class Httpx2WebhookHttpClient:
