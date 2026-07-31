@@ -606,6 +606,14 @@ response body.
 
 Exception text, response bodies, and tracebacks are not persisted.
 
+`WebhookHttpClient` implementations must raise `WebhookTimeoutError` for transport timeouts and
+`WebhookTransportError` for other expected transport failures. Unexpected programming and
+contract errors propagate unchanged and do not become failed delivery attempts. The neutral
+transport errors accept only a bounded exception-class identifier: 1-64 ASCII characters, starting
+with `A-Z` or `a-z`, followed only by ASCII letters, digits, or `_`. Invalid identifiers are
+rejected before they can reach attempt persistence. For example, the HTTP adapter preserves
+`ReadTimeout` and `ConnectError` as the identifiers used in the existing persisted messages.
+
 ## Attempt persistence
 
 The service persists these fields:

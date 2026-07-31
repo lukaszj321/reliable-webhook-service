@@ -11,6 +11,51 @@ from reliable_webhook_service.delivery_http import (
 )
 
 
+@pytest.mark.parametrize("error_type_name", ["ReadTimeout", "ConnectError", "HTTP_2Error"])
+def test_transport_error_accepts_safe_exception_class_identifier(
+    error_type_name: str,
+) -> None:
+    error = WebhookTransportError(error_type_name=error_type_name)
+
+    assert error.error_type_name == error_type_name
+    assert str(error) == f"Webhook transport failed: {error_type_name}"
+
+
+def test_transport_error_accepts_64_character_identifier() -> None:
+    error_type_name = "E" * 64
+
+    error = WebhookTransportError(error_type_name=error_type_name)
+
+    assert error.error_type_name == error_type_name
+
+
+@pytest.mark.parametrize(
+    ("error_type_name", "expected_error"),
+    [
+        (None, TypeError),
+        (42, TypeError),
+        ("", ValueError),
+        (" ", ValueError),
+        ("Connect Error", ValueError),
+        ("Connect.Error", ValueError),
+        ("connection failed", ValueError),
+        ("1ConnectError", ValueError),
+        ("Érror", ValueError),
+    ],
+)
+def test_transport_error_rejects_unsafe_exception_class_identifier(
+    error_type_name: object,
+    expected_error: type[Exception],
+) -> None:
+    with pytest.raises(expected_error):
+        WebhookTransportError(error_type_name=error_type_name)  # type: ignore[arg-type]
+
+
+def test_transport_error_rejects_oversized_exception_class_identifier() -> None:
+    with pytest.raises(ValueError):
+        WebhookTransportError(error_type_name="E" * 65)
+
+
 def test_http_client_posts_json_and_returns_status_code() -> None:
     target_url = "https://example.test/webhooks/orders?tenant=alpha"
     payload = {
@@ -175,3 +220,45 @@ def test_http_client_translates_connect_error_without_exposing_details() -> None
     assert captured.value.error_type_name == "ConnectError"
     assert private_error not in str(captured.value)
     assert isinstance(captured.value.__cause__, httpx2.ConnectError)
+
+
+def test_http_client_rejects_invalid_request_error_class_name() -> None:
+    invalid_request_error_type = type("E" * 65, (httpx2.RequestError,), {})
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise invalid_request_error_type("private transport details", request=request)
+
+    transport = httpx2.MockTransport(handler)
+    with httpx2.Client(transport=transport) as client:
+        webhook_client = Httpx2WebhookHttpClient(client)
+        with pytest.raises(
+            ValueError,
+            match="^error_type_name must be a 1-64 character ASCII identifier starting with a letter$",
+        ) as captured:
+            webhook_client.post_json(
+                target_url="https://example.test/webhooks/invalid-error-name",
+                payload={"event": "order.created"},
+                timeout_seconds=5.0,
+            )
+
+    assert type(captured.value) is ValueError
+    assert isinstance(captured.value.__context__, invalid_request_error_type)
+
+
+def test_http_client_propagates_non_transport_error_unchanged() -> None:
+    unexpected_error = RuntimeError("unexpected programming failure")
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise unexpected_error
+
+    transport = httpx2.MockTransport(handler)
+    with httpx2.Client(transport=transport) as client:
+        webhook_client = Httpx2WebhookHttpClient(client)
+        with pytest.raises(RuntimeError) as captured:
+            webhook_client.post_json(
+                target_url="https://example.test/webhooks/programming-error",
+                payload={"event": "order.created"},
+                timeout_seconds=5.0,
+            )
+
+    assert captured.value is unexpected_error
