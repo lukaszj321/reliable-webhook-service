@@ -19,19 +19,37 @@ stream, and HTTP-response behavior is deterministic and test-local.
 
 | Path | Current flow | Required policy-rejection behavior |
 | --- | --- | --- |
-| Manual | The API transaction performs HTTP, records a completed attempt, and commits | Validate before HTTP. Persist a durable rejection in the manual transaction, create no attempt, and do not mutate a job. |
-| Worker | Claim transaction changes `pending -> processing`; one completion transaction per job performs HTTP, creates an attempt, and chooses `succeeded`, `pending`, or `dead_letter` | Validate in completion before HTTP. Atomically insert a rejection and set the existing job to `dead_letter`; continue the batch. |
-| Recovery | A separate transaction changes stale `processing -> pending` and sets `next_attempt_at=recovered_at` | Ignore terminal rejected jobs. An interrupted pre-commit validation remains `processing` and follows normal recovery. |
+| Manual | The API transaction performs HTTP, records a completed attempt, and commits | Validate before HTTP. Return a tagged rejection outcome, persist and commit it in the route-owned transaction, then return a safe `422`; create no attempt and do not mutate a job. |
+| Worker | Current code bulk-claims due jobs as `processing`, sets `updated_at`, commits those claim locks, passes only job IDs, then completes jobs serially through an unlocked reload. It has no durable claim identity. | Follow-up 1 replaces bulk claim with a one-job just-in-time claim, increments a durable `claim_generation`, propagates an immutable claim handle, and requires pre-request and locked completion validation. |
+| Recovery | A separate transaction finds stale `processing` rows by `updated_at`, changes them to `pending`, and sets `next_attempt_at=recovered_at` | Follow-up 1 uses a dedicated `processing_started_at` age timestamp. Recovery invalidates the old handle by changing status, retains its generation, and the next claim increments the generation. |
 | Replay | A terminal job is locked and reset to `pending`, `attempt_count=0`, and a new due time | Enqueue under the existing row lock without DNS. Worker completion performs the authoritative current-policy check and may terminalize another rejection. Preserve all rejection history. |
 
 The important recovery sequence stays `processing -> stale recovery -> pending -> processing`.
 Validation and terminalization belong to completion, not claim: a crash before completion commit is
 recoverable. Earlier per-job commits remain committed. A permanent rejection is a normal per-job
-outcome and must not stop later claimed jobs.
+outcome and must not stop later eligible jobs.
+
+The selected follow-up contract removes up-front batch claim structurally. An iteration may process
+at most the existing `WEBHOOK_WORKER_PROCESSING_LIMIT=100`, but claims at most one due job
+immediately before executing it. Other jobs remain `pending` while waiting. Only after the current
+job's completion transaction commits or rolls back may the iteration claim the next job. Recovery
+therefore sees at most the actively owned `processing` job for that serial iteration, rather than
+jobs aging in a processing queue.
 
 ## Invariants
 
 - Resolve once for a connection and validate every returned address, fail closed.
+- Apply one monotonic delivery deadline to resolution, snapshot validation, every connection
+  attempt, TLS setup, request write, and response read. Each operation receives only the remaining
+  budget, and no operation or dial starts when that budget is exhausted.
+- Bound the single claimed job from claim through completion. Pending jobs do not consume a stale
+  lease while waiting their turn.
+- Fence every worker-owned persistence path with an immutable claim handle containing `job_id`,
+  `delivery_cycle`, and a monotonically increasing `claim_generation`. A timestamp determines claim
+  age; it must never substitute for claim identity.
+- Normalize and deduplicate answers before enforcing both an address-count limit and a separate
+  connection-attempt limit. Never silently truncate an oversized answer set. Order approved
+  addresses deterministically by IP family and then packed numeric value.
 - Dial only numeric literals from the immutable approved snapshot. Fallback stays within that
   snapshot and performs no second lookup.
 - Preserve the original hostname for HTTP `Host`, TLS SNI, hostname verification, certificate
@@ -53,6 +71,155 @@ outcome and must not stop later claimed jobs.
   only stable safe metadata needed by its caller's transaction.
 - Preserve current public APIs and schemas until an approved follow-up adds its migration or error
   contract.
+
+### Selected timeout and fallback contract
+
+The production follow-up must preserve `WEBHOOK_DELIVERY_TIMEOUT_SECONDS`, default `10.0`, but
+redefine it as the one finite, positive total monotonic deadline described above rather than a
+fresh timeout for each operation. It adds these bounded settings:
+
+| Setting | Meaning | Default | Valid values and invariant |
+| --- | --- | --- | --- |
+| `WEBHOOK_DELIVERY_MAX_RESOLVED_ADDRESSES` | Maximum unique normalized addresses in one authoritative DNS snapshot | `8` | Integer `1..32`; deduplicate before checking; overflow rejects the whole snapshot |
+| `WEBHOOK_DELIVERY_MAX_CONNECT_ATTEMPTS` | Maximum numeric dials within the approved snapshot | `4` | Integer `1..8` and no greater than the resolved-address limit |
+| `WEBHOOK_WORKER_STALE_SAFETY_MARGIN_SECONDS` | Budget for post-claim preparation, DB/pool waits, completion persistence, and scheduling overhead outside the nested delivery deadline | `30.0` | Finite positive number |
+| `WEBHOOK_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS` | Age after just-in-time claim before the one `processing` job may be recovered | Existing `300.0` | Must be at least the derived claim-to-completion budget, currently `40.0` |
+
+Each just-in-time claim starts one monotonic claim-to-completion budget derived as
+`WEBHOOK_DELIVERY_TIMEOUT_SECONDS + WEBHOOK_WORKER_STALE_SAFETY_MARGIN_SECONDS`, currently
+`10.0 + 30.0 = 40.0` seconds. It covers every post-claim preparation step, database/connection-pool
+wait, the nested delivery deadline, and completion persistence. Every DB, pool, statement, and
+transport operation receives only the remaining claim budget and may not begin when it is
+exhausted; the nested delivery budget is the lesser of its 10-second cap and the remaining claim
+budget. Startup enforces `WEBHOOK_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS >= 40.0` and rejects any
+invalid combination. The current `300.0`-second stale default remains compatible.
+
+This removes the earlier `100 * 10` queue-age problem by leaving waiting jobs `pending`, not by
+adding a fixed margin to bulk-owned processing rows. In supported bounded execution it prevents
+premature recovery of the one active job. It does not provide exactly-once delivery if a process
+dies after the HTTP side effect but before durable completion; that existing at-least-once window
+remains. Future parallelism or bulk claim requires a new ownership/lease derivation and controlled
+tests. Deadline exhaustion maps to a safe timeout, address-count overflow maps to a safe
+destination-policy rejection, and connect-attempt exhaustion maps to a safe transport failure.
+None may expose resolved addresses or resolver details.
+
+### Selected durable claim-identity contract
+
+Follow-up 1 adds `WebhookDeliveryJob.claim_generation BIGINT NOT NULL DEFAULT 0`, backfills every
+existing job to `0`, and enforces a nonnegative value. It is monotonic within one job and is never
+reset by automatic retry, stale recovery, replay, or terminalization. Every successful
+`pending -> processing` claim increments it exactly once. PostgreSQL's signed `BIGINT` maximum is
+`9223372036854775807`; the claim operation checks for that maximum while holding the job row lock
+and returns a fail-closed internal claim-overflow outcome before mutation. It must not rely on a
+database overflow error that aborts the transaction.
+
+Follow-up 1 also adds nullable `processing_started_at`. Its migration sets it to `updated_at` for
+rows that are `processing` at migration time and to `NULL` for every other row. A database
+constraint enforces `processing_started_at IS NOT NULL` exactly when `status='processing'`.
+Operational recovery indexes, filters, and ordering move from `updated_at` to
+`processing_started_at`. `updated_at` remains ordinary row-change metadata. The timestamp answers
+how old the current processing state is; `claim_generation` answers which claim owns it.
+
+The atomic claim transaction selects one claimable pending job under the existing appropriate row
+lock, revalidates that it is still claimable, checks generation overflow, increments
+`claim_generation` once, sets `status='processing'`, sets `processing_started_at` to the normalized
+claim time, and flushes. Before the ORM object is detached or the claim session closes, the service
+returns an immutable scalar `ClaimHandle(job_id, delivery_cycle, claim_generation)`. No supported
+path may set a job to `processing` without performing that increment in the same transaction.
+Worker iteration propagates the complete handle into execution and completion rather than carrying
+only a job ID. The normative worker claim identity is therefore
+`job_id + delivery_cycle + claim_generation`.
+
+Immediately before DNS resolution or HTTP, an application/persistence service performs a
+pre-request validation of the handle against current `status='processing'`, `job_id`,
+`delivery_cycle`, and `claim_generation`. It releases the session and any database resources before
+network work; no row lock is held across DNS or HTTP. A mismatch returns an internal stale-claim
+outcome, performs no DNS or HTTP, creates no attempt or rejection, mutates no job, and lets the
+worker continue its batch. This check narrows but cannot eliminate the race in which recovery
+occurs after validation and while the request is already in flight.
+
+Before any persistent completion change, one shared completion boundary selects the job with
+`SELECT ... FOR UPDATE` and revalidates all three handle fields plus `status='processing'`. Every
+worker persistence path passes through it: successful and failed attempt insertion, retry
+scheduling, transition to `succeeded` or `dead_letter`, and worker policy rejection. The locked
+boundary distinguishes an exact active processing handle, the same retained handle whose accepted
+completion has already changed job state, and an invalidated handle. Only the exact active handle
+may mutate. A handle invalidated by recovery, replay, retry, or another claim returns an internal
+stale-claim outcome and makes no changes: no job update, attempt, rejection, `attempt_count`,
+`next_attempt_at`, terminal reason, or policy pointer. A same-handle job state already written by
+the accepted completion follows the `already-completed` or worker-rejection readback rules below.
+Neither non-mutating result automatically retries the mutation, and the worker continues its batch.
+
+Completion outcomes have two distinct post-completion contracts. Same-handle idempotent readback
+is required only for a worker policy rejection because that path has a durable rejection record
+containing `job_id`, `delivery_cycle`, and `claim_generation`. When the existing worker rejection
+matches the complete handle, `source=worker`, policy identifier/version, and safe reason code,
+persistence may return that existing rejection outcome without creating another rejection,
+attempt, or job mutation. Metadata mismatch is fail-closed.
+
+Successful HTTP delivery, failed HTTP delivery, retry scheduling, retry-exhaustion terminalization,
+and ordinary `WebhookDeliveryAttempt` persistence have no equivalent durable completion-outcome
+identity in this design. After the first completion has committed, a second completion carrying
+the same full handle observes that the job is no longer the matching active `processing` claim and
+returns an internal `already-completed` outcome without another attempt, status change,
+`attempt_count` change, `next_attempt_at` change, or other durable mutation. It does not promise to
+reconstruct the original HTTP response, transport failure, retry decision, or attempt outcome.
+If the status, cycle, or generation instead shows that recovery, replay, retry, or another claim
+has invalidated the handle, the result is `stale-claim`, not `already-completed`, and no outcome
+belonging to another claim may be read back.
+
+The spike deliberately does not add `claim_generation` or a separate completion identity to
+`WebhookDeliveryAttempt`. An attempt remains the record created by one accepted completion
+transaction. Duplicate prevention comes from the locked full-handle check before insertion; a
+later completion creates no second attempt. Exact readback of an ordinary attempt or public
+completion idempotency is outside scope, and no new attempt uniqueness constraint is selected
+without evidence that one is required.
+
+Stale recovery selects and locks processing rows whose `processing_started_at` exceeds the stale
+threshold, sets them to `pending`, clears `processing_started_at`, and preserves
+`delivery_cycle`, `claim_generation`, and `attempt_count`; it creates no attempt or rejection.
+Changing the status immediately invalidates the old handle. The next claim increments the retained
+generation. Retry scheduling likewise changes `processing -> pending`, clears
+`processing_started_at`, and retains the current generation until the next claim. Valid completion
+to `succeeded` or `dead_letter` also clears `processing_started_at` and retains the last generation.
+
+Replay keeps its existing row lock and terminal-only precondition. It increments `delivery_cycle`
+exactly once, sets the job to `pending`, clears terminal projection, and neither resets nor
+increments `claim_generation`; only the future worker claim increments it. Claim identities are
+therefore never reused, including after replay. The required stale sequence is concrete:
+
+- worker A claims `(delivery_cycle=0, claim_generation=1)`;
+- recovery sets `pending` and retains generation `1`;
+- worker B claims `(delivery_cycle=0, claim_generation=2)`;
+- worker A's completion expects generation `1`, observes `2`, and is rejected as stale;
+- worker B's completion expects and observes generation `2` and may continue.
+
+### Selected URL and special-use address policy
+
+Only `http` and `https` targets are supported. URL userinfo is forbidden: any username or password
+causes rejection. Ports `1..65535`, including non-default ports, are allowed; port `0` and values
+outside that range are rejected. A non-default port does not change address classification and is
+subject to the same deadline, connection, proxy, and peer rules.
+
+Follow-up 2 must implement and test this normative policy rather than rely on one broad
+`is_global` predicate:
+
+| Address class | IPv4 examples/ranges | IPv6 examples/ranges | Decision |
+| --- | --- | --- | --- |
+| Public globally routable unicast | Public unicast not covered below | Public global unicast not covered below | Allow |
+| Loopback | `127.0.0.0/8` | `::1/128` | Deny |
+| Private / unique-local | RFC 1918 | `fc00::/7` | Deny |
+| Link-local | `169.254.0.0/16` | `fe80::/10` | Deny |
+| Unspecified | `0.0.0.0/8` | `::/128` | Deny |
+| Multicast | `224.0.0.0/4` | `ff00::/8` | Deny |
+| Carrier-grade NAT/shared | `100.64.0.0/10` | Not applicable | Deny |
+| Documentation and benchmarking | RFC 5737 and benchmark ranges | RFC 3849 and benchmark ranges | Deny |
+| Reserved, protocol-assignment, and other special-use | IANA special-purpose ranges | IANA special-purpose ranges | Deny |
+| Cloud metadata | `169.254.169.254` and configured provider ranges | Configured provider ranges | Deny |
+| IPv4-mapped IPv6 | Embedded IPv4 in `::ffff:0:0/96` | Same address representation | Classify and enforce both the IPv6 wrapper and embedded IPv4; deny if either is denied |
+
+Literal IP hosts pass through the same normalization and table. For DNS names, every answer must
+be allowed; a mixed answer fails closed before dial.
 
 ## Dependency evidence: httpx2/httpcore2 2.9.1
 
@@ -158,6 +325,40 @@ claims below require the deterministic PoC or a future real-backend compatibilit
 | HTTP proxy | Standard transport contains an HTTP proxy branch | Not confirmed | Real HTTP proxy routing and policy enforcement | Do not support until an equivalent guarded boundary is proven | No |
 | HTTPS proxy | Standard transport contains an HTTPS proxy branch | Not confirmed | Real HTTPS proxy routing and policy enforcement | Do not support until an equivalent guarded boundary is proven | No |
 | SOCKS proxy | Standard transport contains a SOCKS proxy branch | Not confirmed | Real SOCKS routing and policy enforcement | Do not support until an equivalent guarded boundary is proven | No |
+| Shared deadline model | Current production supplies one timeout value, not an end-to-end budget | Fake clock demonstrates resolution and fallback consuming one decreasing budget | Real resolver, socket, TLS, response, and scheduler timing | Treat `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` as one monotonic end-to-end deadline | No |
+| Address and attempt limits | No production limits exist | PoC deduplicates before rejecting overflow and caps numeric dials | Real transport enforcement | Default to 8 unique answers and 4 attempts with bounded configuration | No |
+| Fake clock | Not applicable | Deterministically advances without sleep or system time | Timing fidelity of production operations | Use injectable monotonic time in focused tests | No |
+| Just-in-time single-job claim | Current code bulk-claims up to 100 jobs; it does not implement this contract | Not confirmed | Production job ownership and transaction integration | Claim one due job immediately before execution; leave later jobs pending | No |
+| `claim_generation` schema | Current jobs have no claim-generation field | Not confirmed | Migration, database constraint, overflow handling, and deployed worker compatibility | Add nonnegative monotonic `BIGINT NOT NULL DEFAULT 0`; never reset it | No |
+| Increment-on-claim | Current claim changes status and `updated_at` only | Not confirmed | Atomic PostgreSQL increment under concurrent claimers | Increment exactly once in the locked `pending -> processing` transaction | No |
+| Immutable claim handle | Current processing carries only job IDs after claim | Not confirmed | Application-service propagation through worker execution | Carry scalar `(job_id, delivery_cycle, claim_generation)` | No |
+| Pre-request claim validation | Current execution begins from a job-ID reload and status check | Not confirmed | Real session lifecycle and recovery race | Validate the full handle immediately before DNS/HTTP without holding a network-time lock | No |
+| Completion claim revalidation | Current completion performs an unlocked load and checks only `status` | Not confirmed | Real PostgreSQL completion/recovery/replay serialization | Re-lock and validate status plus the full handle before any persistence | No |
+| Stale-recovery invalidation | Current recovery uses `updated_at` and has no claim identity | Not confirmed | `processing_started_at` migration, query plan, and recovery race | Clear processing timestamp, retain generation, and reject the old handle | No |
+| Late worker after reclaim | Current code cannot distinguish two claims in one cycle | Not confirmed | Worker A/recovery/worker B integration with independent sessions | Reject A by generation mismatch and allow B | No |
+| PostgreSQL claim concurrency | Current `SKIP LOCKED` claim serializes row selection but has no generation | Not confirmed | Two claimers plus recovery/completion row-lock tests | Require distinct generations and one consistent locked winner | No |
+| Stale-completion observability | Current code raises on non-processing state and has no safe stale outcome | Not confirmed | Metrics/log integration and redaction | Emit only a redacted stale-claim log or metric and continue the batch | No |
+| Residual at-least-once window | Current design already allows an HTTP effect before durable completion | Not confirmed | Recovery during a real in-flight request | Fence persistence, not remote effects; retain at-least-once semantics | No |
+| Same-handle worker-rejection readback | Current runtime has no worker policy-rejection record | Not confirmed | Two completion transactions and conflict-safe PostgreSQL readback | Permit exact readback only for a matching worker rejection record | No |
+| Duplicate success completion | Current runtime has no `already-completed` outcome | Not confirmed | Concurrent same-handle success completion | Create at most one attempt; return `already-completed` without replaying the HTTP outcome | No |
+| Duplicate failure completion | Current runtime has no `already-completed` outcome | Not confirmed | Retryable and retry-exhausted concurrent completion | Apply one attempt/state transition; return `already-completed` without mutation | No |
+| `already-completed` outcome | Current runtime raises or follows existing state paths rather than exposing this internal result | Not confirmed | Locked same-handle post-completion classification | Distinguish accepted prior completion from stale ownership without promising ordinary outcome readback | No |
+| `stale-claim` outcome | Current runtime has no generation fence or stale outcome | Not confirmed | Recovery/reclaim and different-generation completion | Reject invalidated handles without mutation or cross-claim readback | No |
+| Delivery-attempt identity | Attempts have no claim-generation or completion identity | Not confirmed | Duplicate completion integration tests | Keep attempts unchanged; rely on the pre-insert full-handle fence | No |
+| Claim-to-completion budget | Current production has separate delivery and stale timeout values | Not confirmed | DB/pool/statement timeout enforcement and scheduling overhead | One 40-second monotonic budget: 10-second delivery cap plus 30-second margin | No |
+| Two-worker stale recovery | Recovery and claim are separate current transactions | Not confirmed | One long active delivery and a later eligible job remaining pending | Verify bounded ownership without claiming exactly-once guarantees | No |
+| `dead_letter` terminal reason | Current status is terminal but exposes no reason field | Not confirmed | Schema, migration, serialization, and client compatibility | Add `terminal_reason` and nullable `policy_rejection_id` | No |
+| Manual commit before `422` | Current route commits only after a successful service return | Not confirmed | Tagged outcome and route-owned completion commit | Commit the rejection before returning a safe `422`; propagate commit failure | No |
+| `delivery_cycle` identity | Replay reuses the job and resets its attempt count | Not confirmed | Migration, row locking, idempotency, and concurrency | Add a monotonic cycle and a worker-only uniqueness boundary per job/cycle | No |
+| Worker rejection identity | Current persistence has no policy-rejection record | Not confirmed | Schema, partial index, completion idempotency, and terminal projection | Use `source=worker`, record the accepted claim generation, and allow at most one rejection per `(job_id, delivery_cycle)` | No |
+| Manual rejection identity | Current manual path has no durable policy-rejection identity | Not confirmed | Route-generated identity, conflict-safe persistence, metadata readback, and transaction integration | Generate one opaque ID per route invocation and accept readback only when all identity metadata matches | No |
+| Source-specific partial uniqueness | Current schema has no corresponding constraints | Not confirmed | Migration and database constraint behavior | Use separate partial unique indexes for worker cycle and manual request identity | No |
+| Manual conflict-safe persistence | Current schema and manual path have no corresponding insert/readback flow | Not confirmed | Real PostgreSQL conflict handling and outer-transaction usability | Use predicate-targeted `ON CONFLICT DO NOTHING RETURNING`; validate full metadata on readback and fail closed on mismatch | No |
+| Manual/worker coexistence | Current runtime implements neither rejection path | Not confirmed | Concurrent persistence and transaction ordering | Permit both sources for the same job/cycle without sharing an idempotency key | No |
+| Worker completion locking | Claim uses a row lock only until the claim transaction commits; current completion reloads without `FOR UPDATE` | Not confirmed | Real PostgreSQL completion/replay serialization | Re-acquire and revalidate the job row in the policy-rejection completion transaction | No |
+| Manual cycle snapshot locking | Current manual path has no policy-rejection snapshot | Not confirmed | Real PostgreSQL manual/replay/worker interleavings | Resolve before locking, then lock the job and snapshot its cycle only for rejection persistence | No |
+| Rejection concurrency | Current replay locks its job, but completion is unlocked and rejection concurrency is not implemented | Not confirmed | Concurrent manual requests, worker completion, and replay | Use one job-first lock order for rejection persistence and isolate source identities | No |
+| `job.policy_rejection_id` integrity | Current job has no terminal-rejection pointer | Not confirmed | Composite foreign key, deferred integrity enforcement, and migration | Permit only a same-job, same-cycle, same-generation `source=worker` record as terminal pointer | No |
 
 ## Scope of proof
 
@@ -182,6 +383,29 @@ isolation.
 The recommended production boundary remains a design recommendation until the follow-up
 implementation verifies the exact real integration.
 
+The fake clock confirms only the intended shared-budget data flow, decreasing remaining budget,
+and refusal to start another fake dial after exhaustion. It does not confirm timing behavior of a
+real resolver, sockets, TLS, response streaming, schedulers, cancellation, or stale recovery.
+Just-in-time single-job claim and the 40-second claim-to-completion budget are design
+recommendations, not repository behavior or PoC/production proof. They require controlled
+two-worker integration tests, including remaining-budget enforcement for delayed DB/pool work.
+Future parallel or bulk ownership invalidates this derivation until it is re-evaluated.
+
+The current repository has no `claim_generation`, no dedicated `processing_started_at`, and no
+immutable claim handle. Current claim/iteration code passes only job IDs, current recovery derives
+age from `updated_at`, and current completion checks status after an unlocked load. The transport
+PoC does not test worker claim ownership. No PostgreSQL integration test was performed for a
+claim/recovery/completion race. The selected claim-generation contract remains a design
+recommendation for follow-up 1 and is not production-proven; real confirmation requires PostgreSQL
+row locks and at least two independent sessions.
+
+The current runtime also implements neither `already-completed` nor `stale-claim` as internal
+completion outcomes, and the transport PoC does not test completion idempotency. No PostgreSQL
+integration test exercised two completion transactions carrying the same or different handles.
+Worker policy-rejection readback, `already-completed`, and `stale-claim` therefore remain follow-up
+1 recommendations. Exact readback of an ordinary HTTP or `WebhookDeliveryAttempt` outcome is not
+a requirement of this spike.
+
 The PoC fake reports its peer through `get_extra_info("peername")`. The installed synchronous
 `httpcore2` `SyncStream` instead exposes the socket peer through
 `get_extra_info("server_addr")`. Therefore the PoC does not prove the production metadata key or
@@ -192,6 +416,9 @@ Status: sufficient for a deterministic PoC and boundary recommendation, but vers
 PoC and source checks are required on dependency upgrade. Production still needs proof for real
 backend peer metadata on supported platforms, timeouts and exception mapping, concurrent snapshot
 ownership, TLS failure behavior, IPv6 zones, cancellation, and lifecycle under load.
+It also needs production evidence that claim/transaction/scheduling overhead fits the selected
+margin, only one job is claimed per serial iteration step, and later eligible jobs remain pending
+until their turn.
 
 ## Evaluated transport approaches
 
@@ -221,7 +448,8 @@ Exact command:
 & ".\.venv\Scripts\python.exe" -m pytest -W error -p no:cacheprovider tests/experimental/test_webhook_ssrf_boundary_spike.py
 ```
 
-Result on 2026-08-02: `6 passed in 0.51s` (exit code 0).
+The original spike result was `6 passed in 0.51s` (exit code 0). The corrective PoC now contains
+ten tests; its current result is recorded by the validation report rather than asserted here.
 
 Confirmed through deterministic event ordering:
 
@@ -233,6 +461,14 @@ Confirmed through deterministic event ordering:
 - default keepalive reuses the guarded connection and skips second-request resolution;
 - `max_keepalive_connections=0` causes a fresh resolve, dial, and peer guard per request;
 - monkeypatched environment proxy discovery is not called with `trust_env=False`.
+- a fake resolver and every fake fallback dial consume one monotonic budget, later operations see
+  only the remainder, and no third dial starts after exhaustion;
+- the default four-attempt cap permits exactly four failed approved dials and prevents a fifth;
+- raw answers above the default count proceed when deduplication leaves exactly eight unique
+  addresses, proving deduplication precedes the limit check;
+- nine unique addresses exceed the default eight-address limit and fail closed before every dial;
+- all deadline/limit cases keep one resolver call, use only the approved snapshot, and use no
+  sleep, system clock, DNS, or sockets.
 
 Unconfirmed by this offline PoC:
 
@@ -261,27 +497,222 @@ as a retryable transport failure. Worker and manual application services catch t
 and persist it through the shared rejection service inside their own caller-owned transaction.
 Persistence must not commit independently.
 
-Worker completion converts the signal to the selected terminal job/rejection outcome. The manual
-service persists a rejection without job mutation, and the manual route returns deterministic
-`422 Unprocessable Entity` with the safe body
-`{"detail":"Webhook destination is not permitted"}`. Existing successful manual response status
-and schema remain unchanged. Tests must cover catch ordering, no generic normalization, atomic
-commit/rollback, stable safe response, and absence of raw address/resolver/exception leakage.
+Worker completion converts the signal to the selected terminal job/rejection outcome. Manual
+delivery uses a different, concrete transaction contract: the service returns a tagged HTTP
+delivery outcome or destination-policy rejection outcome and never raises after persisting the
+rejection. At the beginning of each manual route invocation, before calling the service, the route
+generates one opaque `manual_delivery_request_id` and passes that same value through the service and
+persistence operation. Destination-policy resolution and evaluation finish before acquiring a job
+row lock, so no database lock is held across DNS or transport work. Only on a policy-rejection
+completion path does the service acquire that job with `SELECT ... FOR UPDATE`, re-read its
+`job_id` and `delivery_cycle` as the authoritative audit snapshot, insert and flush the manual
+rejection, and retain the lock until the route-owned transaction commits. The rejection variant
+contains both its `rejection_id` and `manual_delivery_request_id`. If the job or cycle cannot be
+loaded consistently, the transaction fails without persisting a rejection or returning `422`.
+Only after a successful commit does the route return deterministic
+`422 Unprocessable Entity` with a safe body containing the opaque IDs and no target, address, or
+resolver details. Commit failure rolls back or propagates as an internal failure and must never
+return a false `422` that implies durable audit. The application must not automatically retry the
+mutation after an ambiguous commit result. Reusing the same `manual_delivery_request_id` within the
+same request-processing attempt returns the existing rejection or otherwise preserves an
+idempotent result only after verifying the existing record's complete identity metadata; a new
+independent HTTP request receives a new ID. This is not public
+cross-request idempotency. No delivery attempt is created and no job field changes. Batch workers
+do not use this route-owned commit path. Existing successful manual response status and schema
+remain unchanged until follow-up 1 adds the rejection response contract.
 
 ## Durable policy-rejection decision
 
-For permanent pre-HTTP worker rejection, atomically set the existing job to `dead_letter` and
-insert a separate durable policy-rejection record in the completion transaction. Set
-`next_attempt_at=None`, leave `attempt_count` unchanged, create no `WebhookDeliveryAttempt`, and
-continue the batch. Recovery ignores it because it selects `processing` only. Replay is allowed
-to enqueue without DNS while holding the existing job row lock; it resets the normal retry budget
-and preserves all rejection history. Worker completion then performs authoritative current-policy
-validation and may atomically dead-letter the job with another durable rejection record.
+`dead_letter` is defined as a terminal job for which no further automatic retry is scheduled.
+Retry-budget exhaustion and destination-policy rejection are distinct terminal reasons, not
+synonyms. Add a nullable public `terminal_reason` enum with `retry_exhausted` and
+`destination_policy_rejected`, plus nullable UUID `policy_rejection_id`, set only for the latter.
+Both fields are null for non-terminal jobs. Existing dead-letter rows are backfilled and projected
+as `retry_exhausted`; clients never infer the reason from `attempt_count`.
 
-Manual rejection inserts the durable record without job mutation. The record should distinguish
-manual/worker source and hold stable references, target snapshot, policy version, normalized
-reason, non-sensitive address evidence, and timestamp. Exact fields, constraints, retention, and
-exposure belong to the migration follow-up.
+For permanent pre-HTTP worker rejection, atomically set the existing job to `dead_letter`, set
+`terminal_reason=destination_policy_rejected` and its `policy_rejection_id`, and insert a separate
+durable policy-rejection record in the completion transaction. Set `next_attempt_at=None`, leave
+`attempt_count` unchanged, create no `WebhookDeliveryAttempt`, and continue the batch. Recovery
+ignores it because it selects `processing` only.
+
+Add nonnegative monotonic `WebhookDeliveryJob.delivery_cycle`, initially and historically
+backfilled to `0`. Manual replay locks the job and increments `delivery_cycle` exactly once in the
+same transaction that changes it to `pending`; automatic retries do not change it. Every durable
+rejection has a required `source` enum with exactly `worker` and `manual`, a required `job_id`, a
+required `delivery_cycle`, a policy identifier or policy version, a safe reason code, and
+`created_at`. The cycle stored on a manual record is an audit snapshot only: it neither
+terminalizes that cycle nor participates in manual uniqueness.
+
+Add the distinct durable ownership fence `WebhookDeliveryJob.claim_generation BIGINT NOT NULL
+DEFAULT 0`, backfill it to `0`, and enforce nonnegative values. It increases exactly once in every
+atomic claim and is never reset by recovery, retry, replay, or terminalization. Add nullable
+`processing_started_at`, backfilled from `updated_at` only for currently processing rows and null
+otherwise, with a database invariant that it is non-null exactly for `status='processing'`.
+Recovery queries use this dedicated timestamp for age. `updated_at` and `processing_started_at`
+cannot identify ownership; only the immutable `(job_id, delivery_cycle, claim_generation)` handle
+does so. A coordinated deployment is mandatory: the migration and handle-aware claim, execution,
+recovery, and completion code must deploy without old workers that can set `processing` without an
+increment or complete work without the full handle.
+
+A worker rejection is the terminal result for its job cycle. The repository does not currently
+hold a job lock throughout completion: the claim transaction's row lock ends at claim commit, and
+the current completion path performs an unlocked load. Follow-up 1 must therefore re-acquire the
+job with `SELECT ... FOR UPDATE` inside the worker policy-rejection completion transaction. After
+locking and before any rejection insert or job update, it re-reads and validates `status`,
+`delivery_cycle`, `claim_generation`, `terminal_reason`, and `policy_rejection_id` against the
+immutable `ClaimHandle(job_id, delivery_cycle, claim_generation)` captured at claim. Replay,
+worker completion, recovery, and manual rejection persistence use the same deterministic
+job-first lock order.
+
+The worker record contains `rejection_id`,
+`source=worker`, `job_id`, `delivery_cycle`, required `claim_generation`, policy
+identifier/version, safe reason code, and `created_at`; `manual_delivery_request_id` is null. The
+generation is durable provenance for the accepted claim, not the worker uniqueness key. The
+record atomically drives the job to `dead_letter`, clears `processing_started_at`, retains that
+generation on the job, sets `terminal_reason=destination_policy_rejected`, and sets
+`job.policy_rejection_id` to that worker record. The normative idempotency boundary remains a
+PostgreSQL partial unique index, not a table `UNIQUE` constraint:
+
+```sql
+CREATE UNIQUE INDEX ... ON webhook_destination_policy_rejections (job_id, delivery_cycle)
+WHERE source = 'worker';
+```
+
+SQLAlchemy must declare the equivalent `Index(..., unique=True, postgresql_where=...)`. After the
+locked re-read, completion may act only when status and the complete claim handle match. A retry
+of the same already accepted completion may return the existing same-cycle worker rejection only
+when its `job_id`, `delivery_cycle`, and recorded `claim_generation` match the handle and the job's
+valid pointer. It creates no second rejection, creates no `WebhookDeliveryAttempt`, and does not
+increase `attempt_count`. A different or stale generation must not be treated as that idempotent
+completion. Otherwise the new path atomically inserts the worker rejection and updates the
+terminal job fields in the same transaction. The partial index remains a database backstop for a
+residual insert race. Implement that race path with
+`INSERT ... ON CONFLICT DO NOTHING RETURNING` against the partial-index predicate, followed by a
+read and full handle validation of the existing worker rejection, or use a savepoint-equivalent
+that leaves the outer transaction usable. Do not catch a raw `IntegrityError` after it has aborted
+the transaction. A replay can create a new worker rejection only after it atomically advances
+`delivery_cycle`.
+
+A manual rejection is non-terminal. Its record contains `rejection_id`, `source=manual`, required
+`manual_delivery_request_id`, `job_id`, the current `delivery_cycle` as an audit snapshot, policy
+identifier/version, safe reason code, and `created_at`. It does not change job status,
+`delivery_cycle`, `attempt_count`, or `job.policy_rejection_id`, and it cannot block a later worker
+rejection for the same job and cycle. The normative manual idempotency boundary is likewise a
+PostgreSQL partial unique index, not a table constraint:
+
+```sql
+CREATE UNIQUE INDEX ... ON webhook_destination_policy_rejections (manual_delivery_request_id)
+WHERE source = 'manual';
+```
+
+SQLAlchemy must declare the equivalent `Index(..., unique=True, postgresql_where=...)`. One
+accepted manual request can therefore create at most one rejection, while two independent
+requests have distinct IDs and may create two records in the same cycle. There is no deduplication
+promise between independent requests without a separate future public idempotency contract.
+
+Manual persistence must implement re-entry and residual races without aborting the route-owned
+outer transaction. Use PostgreSQL
+`INSERT ... ON CONFLICT (manual_delivery_request_id) WHERE source='manual' DO NOTHING RETURNING`
+targeted to the manual partial-index predicate, followed by readback by
+`manual_delivery_request_id` when the insert returns no row. A savepoint-equivalent is acceptable
+only if it likewise leaves the outer transaction usable. Do not catch and continue from a raw
+`IntegrityError` after PostgreSQL has aborted the transaction.
+
+Readback is an idempotent success only when the existing row has `source=manual`, exactly the same
+`manual_delivery_request_id`, the same `job_id`, the same locked `delivery_cycle` audit snapshot,
+the same policy identifier/version, and identical safe reason semantics (`reason_code` and every
+other normalized non-sensitive reason field). Any mismatch is a
+fail-closed contract violation: roll back or propagate, return no `422`, and do not retry the
+mutation. The job row remains locked until the route-owned commit, and the existing rule against
+automatic retry after an ambiguous commit result remains unchanged.
+
+The migration must enforce source-specific row integrity with `NOT NULL` declarations and `CHECK`
+constraints equivalent to these predicates:
+
+- for `source=worker`, `job_id` and `delivery_cycle` are present and
+  `claim_generation` is present, nonnegative, and `manual_delivery_request_id IS NULL`;
+- for `source=manual`, `job_id`, the audit-snapshot `delivery_cycle`, and
+  `manual_delivery_request_id` are present and `claim_generation IS NULL`;
+- no other `source` value is valid.
+
+Cross-table terminal-pointer integrity cannot be expressed by a plain row `CHECK`. The database
+must give the rejection table a candidate key covering
+`(rejection_id, job_id, delivery_cycle, claim_generation)` and use a composite foreign key, or an
+equivalent relational constraint, from the job's
+`(policy_rejection_id, job_id, delivery_cycle, claim_generation)` values. A deferrable constraint
+trigger, or an equivalent database-enforced mechanism, must additionally verify at transaction
+end that:
+
+- `job.policy_rejection_id IS NULL` unless
+  `terminal_reason=destination_policy_rejected`;
+- a non-null pointer resolves to `source=worker`, never `source=manual`;
+- the pointed record belongs to the same `job_id`, `delivery_cycle`, and `claim_generation`;
+- `terminal_reason=destination_policy_rejected` is valid only with `status=dead_letter` and a
+  non-null valid pointer, while all other terminal reasons and all non-terminal jobs have a null
+  pointer.
+
+Replay, recovery, and corrected worker completion serialize by acquiring the same job row first;
+this is a follow-up requirement, not current completion behavior. A job already `processing` is
+not replayable. The locked worker re-read either observes the exact current handle and completes
+it or returns a stale-claim outcome; replay either wins before claim or waits for and observes
+terminal completion. Replay after a worker rejection advances the cycle exactly once for the
+future worker uniqueness boundary and leaves `claim_generation` unchanged until the next claim.
+
+Manual policy evaluation happens without a job lock, but manual rejection persistence acquires
+the same job row first and retains it through the route-owned commit. This serializes its audit
+snapshot with worker completion and replay without holding a lock across DNS. If manual
+persistence gets the lock first, it records the old cycle and commits before replay can increment
+it. If replay gets the lock and commits first, the later manual persistence records the new cycle.
+The snapshot is therefore defined by lock order, not merely by unconstrained commit timing. A
+manual and worker rejection may coexist, and two distinct manual requests may both persist; manual
+insertion never mutates the locked job. Replay after prior manual records preserves them, while
+replay after terminal worker rejection preserves both sources' history. Attempt numbering
+and `attempt_count` remain independent. The public job projection exposes `terminal_reason` and a
+worker-only `policy_rejection_id`; a manual safe `422` may expose the opaque `rejection_id` and
+`manual_delivery_request_id`, but never IPs, resolver messages, or target details. Manual rejection
+does not change the public job status.
+
+### Claim fencing, recovery, and concurrency
+
+All transitions out of a valid current `processing` claim clear `processing_started_at` and retain
+the last `claim_generation`: retry scheduling changes the job to `pending`, and successful or
+terminal completion changes it to `succeeded` or `dead_letter`. The field is not an indication
+that a job is currently processing. Current ownership always requires all of
+`status='processing'`, matching `delivery_cycle`, and matching `claim_generation`.
+
+The required concurrency outcomes are:
+
+1. If worker A returns after recovery but before another claim, the row is `pending`; A's
+   completion is stale and is rejected without mutation.
+2. If worker A returns after worker B has claimed the job, status is `processing` and the cycle may
+   still match, but the generation differs; A's completion is stale and is rejected without an
+   attempt or rejection.
+3. Worker B may complete only when its job ID, cycle, and generation all match the locked row.
+4. Recovery racing completion A serializes on the same job row lock. If completion obtains the lock
+   while A's handle is current, it completes and recovery later observes a non-processing row. If
+   recovery first confirms staleness and changes the row to `pending`, completion later rejects A.
+   The two transactions cannot persist contradictory terminalizations.
+5. Replay after a terminal worker rejection increments `delivery_cycle`, retains
+   `claim_generation`, and the future claim increments the generation again.
+6. Automatic retry scheduling sets `pending`, clears `processing_started_at`, keeps the cycle and
+   generation, and the next claim increments `claim_generation` exactly once.
+7. Two completion calls carrying the same full handle serialize on the job row lock. The first
+   validates the active processing claim, writes its single attempt or policy outcome, and changes
+   job state. The second performs no mutation. For a matching worker policy rejection it may read
+   back the same rejection outcome; for success, ordinary failure, retry scheduling, or retry
+   exhaustion it returns `already-completed` without reconstructing the first HTTP or attempt
+   outcome. A completion carrying an older or different generation returns `stale-claim` and may
+   not read back the newer claim's outcome.
+
+Pre-request validation and the completion fence prevent a stale owner from starting network work
+when it is already stale and from mutating persistence after recovery. They cannot undo an HTTP
+effect that occurred before recovery. If recovery wins while an already validated request is in
+flight, the remote effect may exist even though the later completion is rejected as stale. The
+single deadline and stale-threshold margin reduce this window but do not eliminate it. The system
+retains at-least-once semantics and does not claim exactly-once delivery. A stale-claim outcome
+emits only a redacted internal log or metric: no target details, resolver details, addresses, or
+payload.
 
 | Worker-state option | Audit/state effect | Decision |
 | --- | --- | --- |
@@ -300,52 +731,308 @@ Persist webhook destination-policy rejections and terminalize worker jobs
 
 ### Follow-up 1 context
 
-Issue #57 selected a separate durable rejection record. A pre-HTTP rejection is not a delivery
-attempt. Worker terminalization and audit insertion must commit atomically; manual rejection must
-preserve the current job. Today `WebhookDeliveryJobExecutionResult.attempt` is required and
-`WebhookDeliveryProcessingJobResult.attempt_id` is a required UUID, so the internal completion and
-processing projections cannot represent a rejection without inventing an attempt.
+Issue #57 selected a separate durable rejection record, an explicit terminal reason, and a stable
+delivery-cycle identity. A pre-HTTP rejection is not a delivery attempt. Worker terminalization and
+audit insertion commit atomically in worker completion; manual delivery instead returns a tagged
+result with a route-generated request identity so its route can commit durable evidence before
+returning `422`. Worker and manual records have distinct database-enforced identity boundaries and
+may coexist for the same job and cycle. A separate monotonic claim generation fences each
+individual worker ownership period, including two claims in the same delivery cycle.
 
 ### Follow-up 1 scope
 
-- Add migration and ORM schema for durable destination-policy rejections.
-- Store stable source (`worker`/`manual`), reason, policy version, target snapshot, safe address
-  evidence, event/endpoint references, optional job reference, and timestamp with constraints.
+- Add migration and ORM schema for durable destination-policy rejections, nonnegative
+  `WebhookDeliveryJob.delivery_cycle`, nullable `terminal_reason`, and nullable
+  `policy_rejection_id` with foreign-key and consistency constraints.
+- Add `WebhookDeliveryJob.claim_generation BIGINT NOT NULL DEFAULT 0`, backfill existing rows to
+  `0`, enforce nonnegative values, and reject a claim at `9223372036854775807` before mutation with
+  an internal overflow outcome. Never reset generation during retry, recovery, replay, or
+  terminalization.
+- Add nullable `processing_started_at`; backfill current processing rows from `updated_at`, leave
+  all other rows null, and enforce non-null exactly for `status='processing'`. Move stale-recovery
+  filters, ordering, and supporting indexes from `updated_at` to this field. Every transition out
+  of processing clears it.
+- Backfill `delivery_cycle=0` and map existing `dead_letter` rows to
+  `terminal_reason=retry_exhausted`; non-terminal rows keep terminal fields null.
+- Store required `source` enum (`worker`/`manual`), required `job_id`, required
+  `delivery_cycle`, reason, policy version, safe target snapshot/evidence, event/endpoint
+  references, and `created_at`. Add nullable `manual_delivery_request_id` and nullable
+  `claim_generation`: worker rows require the accepted generation; manual rows require it to be
+  null.
+- Add PostgreSQL partial unique indexes, not table unique constraints: worker
+  `(job_id, delivery_cycle) WHERE source='worker'` and manual
+  `(manual_delivery_request_id) WHERE source='manual'`. Declare both through SQLAlchemy
+  `Index(..., unique=True, postgresql_where=...)` and verify the generated migration DDL.
+- Add database row checks requiring a null manual ID for worker records and a non-null manual ID
+  for manual records; both sources require job and cycle. Back these with source-specific tests.
+- Enforce the job pointer relationally: a composite foreign key or equivalent covers
+  `policy_rejection_id`, the same `job_id`, the same `delivery_cycle`, and the same
+  `claim_generation`; a deferred constraint trigger or equivalent requires the target to have
+  `source=worker` and requires terminal reason, pointer, status, and nullability to remain
+  consistent. A manual record can never be the terminal pointer.
+- Preserve all worker and manual rejection history across replay. Migration/backfill must leave
+  legacy terminal rows as `retry_exhausted` with a null policy pointer.
 - Add one service-owned persistence operation used inside the caller transaction.
 - Add the neutral typed `WebhookDestinationPolicyRejected` signal and safe metadata contract.
 - Change the internal execution/completion result to a tagged outcome: an HTTP-attempt outcome has
   its existing required attempt/attempt ID, while a policy-rejected outcome has
   `attempt_id=None` and a required `rejection_id`. Update the processing projection accordingly;
   do not synthesize an attempt.
-- Worker completion inserts rejection and changes locked `processing` job to `dead_letter` with
-  `next_attempt_at=None` and unchanged `attempt_count`, returns the tagged rejection outcome, and
-  lets the processing cycle continue the batch.
+- Replace up-front bulk claim with a just-in-time one-job claim. An iteration may complete at most
+  `WEBHOOK_WORKER_PROCESSING_LIMIT` jobs, but each next due job stays `pending` until the prior
+  completion commits or rolls back and it is immediately ready to execute.
+- In the same locked claim transaction, revalidate claimability, check overflow, increment
+  `claim_generation` exactly once, set `processing`, set `processing_started_at`, and return an
+  immutable scalar `ClaimHandle(job_id, delivery_cycle, claim_generation)` before ORM detachment.
+  No supported path may set processing without the increment. Worker iteration carries this full
+  handle through execution and completion.
+- Immediately before DNS or HTTP, have the persistence/application boundary validate
+  `status='processing'` and every handle field, then release database resources before transport.
+  A mismatch returns a stale-claim outcome with no DNS, HTTP, attempt, rejection, or job mutation;
+  the batch continues. Do not put claim validation ownership in the transport adapter.
+- Start one monotonic 40-second claim-to-completion budget at claim. Carry its remaining budget
+  through preparation and completion persistence; DB, pool, and statement waits may not start
+  after exhaustion. Validate stale timeout against this derived budget while retaining the current
+  compatible 300-second default. Expose the remaining budget boundary for follow-up 2's nested
+  transport deadline.
+- Worker policy-rejection completion re-acquires the job with `SELECT ... FOR UPDATE`; the claim
+  lock no longer exists after claim commit. Using the deterministic job-first lock order shared
+  with replay and manual persistence, re-read `status`, `delivery_cycle`, `terminal_reason`,
+  `claim_generation`, `policy_rejection_id`, and the exact
+  `ClaimHandle(job_id, delivery_cycle, claim_generation)` before every insert or update. Apply the
+  same fence to attempt success/failure, retry, succeeded/dead-letter, and policy-rejection paths.
+  An already terminal same-cycle, same-generation worker rejection may return the existing tagged
+  outcome after full source, handle, policy-version, and safe-reason validation. This exact
+  same-handle readback applies only to worker policy rejection. For success, failed delivery,
+  retry scheduling, retry exhaustion, and ordinary attempts, a second same-handle completion
+  returns `already-completed` without another mutation and without reconstructing the original
+  HTTP or attempt outcome. A different generation returns `stale-claim` and cannot read another
+  claim's outcome. Otherwise,
+  insert the rejection and change the locked `processing` job to `dead_letter` with
+  `terminal_reason=destination_policy_rejected`, its `policy_rejection_id`,
+  `next_attempt_at=None`, cleared `processing_started_at`, retained claim generation, and unchanged
+  `attempt_count` in the same transaction. Any handle mismatch returns a stale-claim outcome and
+  changes none of those fields or related records; it is not automatically retried and the batch
+  continues.
+- Do not add `claim_generation`, a completion key, or a new uniqueness constraint to
+  `WebhookDeliveryAttempt` in this issue. The locked full-handle validation must occur before its
+  single insert. Public or exact ordinary-attempt outcome readback remains a non-goal.
+- Treat the partial worker index as a residual-race backstop. Use
+  `INSERT ... ON CONFLICT DO NOTHING RETURNING` followed by reading the existing rejection, or a
+  savepoint-equivalent that preserves outer-transaction usability; never recover by catching a raw
+  `IntegrityError` in an aborted transaction.
 - Preserve the existing fatal path: non-policy errors roll back the current completion transaction
   and stop the batch rather than being converted to rejection outcomes.
-- Manual delivery catches the typed signal, inserts rejection without job mutation, and exposes
-  the safe deterministic policy-error response while leaving its success response unchanged.
-- Replay enqueues under its existing row lock without DNS, preserves rejection history, and leaves
-  authoritative validation to worker completion; recovery still selects only `processing`.
+- At the start of manual delivery, the route generates exactly one opaque
+  `manual_delivery_request_id` and passes it to the service and persistence operation. The service
+  performs destination-policy evaluation without holding a job lock. Only for a rejection does it
+  acquire the job with `SELECT ... FOR UPDATE`, using the shared job-first lock order, and re-read
+  the authoritative `job_id` and `delivery_cycle` snapshot. It then inserts and flushes a
+  `source=manual` rejection without job mutation and returns a tagged policy outcome containing
+  both `rejection_id` and the request ID; the lock remains until route-owned commit. Missing or
+  inconsistent job/cycle state fails without persistence or `422`. Reuse of that ID within the
+  same request-processing attempt is idempotent, while each independent request receives a new
+  ID. The route returns the safe deterministic `422` only after commit. Commit failure
+  rolls back/propagates and cannot return `422`; do not automatically retry after an ambiguous
+  commit. This does not introduce a public cross-request idempotency contract. Batch workers do
+  not use this transaction contract.
+- Implement manual insert/re-entry with PostgreSQL
+  `INSERT ... ON CONFLICT (manual_delivery_request_id) WHERE source='manual' DO NOTHING RETURNING`
+  and read back by the request ID when no row is returned, or use a savepoint-equivalent that
+  preserves the route-owned outer transaction. Never continue after a raw `IntegrityError` has
+  aborted that transaction. Treat readback as idempotent only after verifying `source=manual`, the
+  exact request ID, the locked `job_id`/`delivery_cycle` snapshot, policy identifier/version, and
+  exact safe reason semantics. Any mismatch rolls back or propagates without `422` or mutation
+  retry; retain the job lock through route commit.
+- Replay locks the job, increments `delivery_cycle` exactly once in the same transaction that sets
+  `pending`, resets the retry budget, clears terminal projection, preserves rejection history, and
+  performs no DNS. It neither resets nor increments `claim_generation`; the next claim does.
+  Automatic retry does not increment the cycle or generation while scheduling, but its next claim
+  increments generation. Stale recovery locks by `processing_started_at`, changes processing to
+  pending, clears that timestamp, and retains cycle, generation, and count. Define serialization for
+  concurrent replay, worker completion, and manual rejection persistence under their shared
+  job-first row-lock order. Historical records from both sources remain immutable; replay advances
+  only the future worker uniqueness boundary. Manual-first records the old cycle before replay;
+  replay-first causes manual persistence to record the new cycle. Manual policy evaluation itself
+  remains outside the lock.
+- Extend public response models so clients distinguish `retry_exhausted` from
+  `destination_policy_rejected` directly, with `policy_rejection_id` only for the latter; do not
+  require inference from `attempt_count`. The pointer may identify only the current-cycle worker
+  record. A manual `422` may return opaque `rejection_id` and `manual_delivery_request_id`, while
+  the public job status and terminal projection remain unchanged and no address, resolver message,
+  or target detail is exposed.
+- Treat the migration and handle-aware worker code as one coordinated deployment boundary. The
+  rollout sequence is normative: stop and drain every old worker; verify that no old completion is
+  in flight; apply the migration, backfill, indexes, and constraints during a maintenance window or
+  use the explicitly specified staged-constraint procedure; atomically deploy the supported
+  handle-aware claim, recovery, completion, worker-iteration, and operations code; only then resume
+  workers. Old workers that pass only job IDs, set processing without generation increments, or
+  complete without the full handle must never run with the new enforced invariants. The public API
+  and manual-delivery route may remain available only if the deployment can guarantee they do not
+  start, depend on, or race an old worker completion; otherwise they are paused for the same
+  maintenance window. This availability rule does not change manual outcome or transaction
+  semantics.
+- Emit a redacted log or metric for stale-claim and claim-overflow outcomes without target,
+  resolver, address, or payload data.
 
 ### Follow-up 1 acceptance criteria
 
 - Worker terminalization and exactly one rejection commit together; rollback leaves neither.
-- Idempotency is enforced under a documented uniqueness rule.
+- Worker completion explicitly re-acquires the job with `SELECT ... FOR UPDATE` after the claim
+  lock has ended. Before inserting or updating, it revalidates status, cycle, terminal fields, and
+  the exact `job_id + delivery_cycle + claim_generation` handle under that lock.
+- Initial and backfilled `claim_generation` is `0`. The first successful claim changes it to `1`,
+  every later successful claim increments it exactly once, and two concurrent claimers cannot
+  receive the same generation. Overflow at signed-BIGINT maximum returns a fail-closed outcome
+  before mutation and does not abort the transaction. No supported service, recovery, retry, or
+  replay path can set `status='processing'` without the same-transaction increment.
+- Initial `processing_started_at` is backfilled from `updated_at` only for processing rows and null
+  otherwise. Claim sets it; recovery, retry scheduling, success, and dead-letter completion clear
+  it. Database constraints enforce its relationship to processing status, and recovery queries no
+  longer use `updated_at` as claim age.
+- Claim returns and worker iteration propagates immutable
+  `ClaimHandle(job_id, delivery_cycle, claim_generation)`. Immediately before DNS/HTTP, persistence
+  code validates all fields and status without holding a lock across network work. A stale handle
+  starts no DNS or HTTP and the batch continues.
+- Every completion path locks and validates the exact handle before mutation. A stale worker after
+  recovery or after a new claim creates no attempt or policy rejection, changes no job/count/time
+  or terminal field, is not automatically retried, and does not stop later batch jobs. The current
+  worker with the matching handle can complete.
+- Initial and backfilled `delivery_cycle` is `0`; replay increments it once per successful
+  terminal-to-pending transition, automatic retry never increments it, and row locking prevents a
+  double increment under concurrent replay.
+- A PostgreSQL partial unique index on `(job_id, delivery_cycle) WHERE source='worker'` permits at
+  most one terminal worker rejection per cycle. Retrying the same completion returns the
+  existing/idempotent result without a duplicate only when its recorded generation matches the
+  accepted handle; a second replay permits one worker rejection for the new cycle and preserves
+  all earlier history.
+- A PostgreSQL partial unique index on `(manual_delivery_request_id) WHERE source='manual'` permits
+  one rejection for one manual request identity. Reusing the identity inside the same request
+  processing does not duplicate it only when the read-back source, request ID, locked job/cycle,
+  policy identifier/version, and safe reason semantics all match. A mismatch fails closed without
+  `422`; two independent manual requests in one cycle receive different IDs and create two
+  records.
+- A manual rejection and worker rejection for the same `job_id` and `delivery_cycle` coexist.
+  The manual record does not block worker terminalization and does not set
+  `job.policy_rejection_id`.
+- Database constraints reject invalid source-specific nullability. `job.policy_rejection_id`
+  resolves only to a `source=worker` record with the same job, cycle, and claim generation, is
+  required exactly for `destination_policy_rejected` on `dead_letter`, and is null otherwise.
+  Worker records require generation and manual records require it to be null. These guarantees
+  are database-enforced rather than application-only.
 - No attempt is created and `attempt_count` is unchanged.
 - Tagged execution and processing results expose `rejection_id` without an `attempt_id`; existing
   HTTP-attempt outcomes retain their current attempt contracts.
-- Rejected jobs are not recovered and later claimed jobs continue; fatal non-policy errors still
+- Rejected jobs are not recovered and later eligible jobs continue; fatal non-policy errors still
   roll back and stop processing.
-- Manual rejection records evidence without job mutation and returns the stable redacted `422`
-  response; its successful response is unchanged.
-- Replay performs no DNS while holding the row lock, retains history, and a repeated worker denial
-  produces a new atomic rejection/`dead_letter` completion.
+- At most one job is claimed `processing` immediately before execution; later jobs remain
+  `pending`. The next claim starts only after the current completion transaction ends.
+- The claim-to-completion budget is 40 seconds for current defaults. Preparation, DB/pool waits,
+  statements, delivery, and completion use remaining budget only; operations do not begin after
+  exhaustion, and startup rejects stale timeout below the derived budget.
+- In controlled two-worker cases, an active bounded job is not stale-recovered and a later/last
+  eligible job remains pending until its turn. Neither case performs parallel HTTP or duplicate
+  delivery, without claiming exactly-once behavior after an HTTP-side-effect/process-crash window.
+- `dead_letter` means no further automatic retry. Public projections distinguish
+  `retry_exhausted` and `destination_policy_rejected`; policy rejection has its rejection ID and
+  does not look like exhausted retry budget. Existing dead-letter rows serialize as
+  `retry_exhausted`, and non-terminal rows expose neither terminal field.
+- Manual service returns a tagged rejection result containing the persisted rejection and manual
+  request IDs; rejection is flushed and committed by the route before the stable redacted `422`.
+  Commit failure rolls back/propagates without `422`, and an ambiguous commit is not automatically
+  retried. No attempt, job mutation, terminal pointer, or raw resolver/address/target detail occurs.
+- Manual policy evaluation holds no job lock. On rejection, persistence locks and re-reads the job
+  before snapshotting its cycle, keeps the lock through route commit, and fails without persistence
+  or `422` if consistent state cannot be loaded. In controlled interleavings, manual-first records
+  the old cycle before replay increments it, while replay-first makes manual record the new cycle.
+- Concurrent or re-entered persistence with the same manual identity produces exactly one row and
+  consistent idempotent outcomes only when all identity metadata matches. The conflict-safe path
+  leaves both route-owned outer transactions usable. Metadata mismatch rolls back/propagates with
+  no `422`, and does not retry the mutation.
+- Replay performs no DNS while holding the row lock, retains history, clears terminal projection,
+  retains `claim_generation`, and leaves authoritative revalidation to worker completion.
+  Concurrent replay and worker
+  completion serialize on the job row after worker completion re-acquires it; a processing job
+  cannot be replayed. Replay after terminal worker rejection advances the next cycle, while replay
+  after manual records preserves them and does not reinterpret their cycle snapshots.
+- Stale recovery locks a processing row, confirms `processing_started_at` crosses the threshold,
+  sets pending, clears the timestamp, and retains cycle, generation, and attempt count. A worker A
+  completion after recovery is rejected by status; after worker B's new claim it is rejected by
+  generation. Recovery racing A's completion serializes on the row lock and cannot create two
+  contradictory terminal results.
+- Worker rejection records persist the accepted generation. The terminal pointer resolves to the
+  same worker record/job/cycle/generation, while manual records have null generation. Automatic
+  retry and replay do not change generation before a claim; every future claim increments it.
+- Stale-claim and overflow outcomes emit only redacted observability. Claim fencing prevents stale
+  persistence but does not undo an HTTP side effect that occurred before recovery; the documented
+  deadline/stale margin mitigates this residual at-least-once window without promising exactly
+  once.
+- Migration and worker deployment are coordinated so an old job-ID-only worker cannot coexist with
+  the new handle-aware claim and completion paths.
+- Two concurrent worker policy-rejection completions carrying the same immutable
+  `ClaimHandle(job_id, delivery_cycle, claim_generation)` create exactly one worker row and both
+  return the same rejection ID and idempotent rejection outcome. Both outer transactions remain usable; neither creates an
+  attempt nor changes `attempt_count`. A completion with the same job/cycle but a different
+  `claim_generation` is stale: it must not reuse or read the current generation's worker rejection
+  as its own successful idempotent outcome, and it returns the stale-claim outcome with no attempt,
+  rejection, or job mutation. The residual same-handle conflict path uses conflict-safe insert/read
+  or a savepoint, never a raw aborted-transaction `IntegrityError` path.
+- Two same-handle success completions create at most one attempt; the second returns
+  `already-completed` without mutation and without reproducing the original HTTP outcome. The same
+  rule applies separately to retryable transport failure and retry-exhausted failure: at most one
+  attempt and one retry or terminal transition are persisted, and the second completion returns
+  `already-completed`. Any completion from an older or different generation returns `stale-claim`
+  and cannot read back an outcome belonging to the newer claim.
 
 ### Follow-up 1 tests
 
-Migration/model constraints; tagged execution/processing projection tests; worker PostgreSQL
-commit/rollback/continuation and fatal-error tests; manual record-only transaction and API safe
-response/no-leak tests; recovery and replay-without-DNS/repeated-rejection regressions.
+Migration/backfill and database-enforced source/nullability, PostgreSQL partial-unique-index DDL,
+composite-reference, and terminal-pointer constraint tests; initial cycle and exactly-once replay
+increment; initial/backfilled `claim_generation=0`; first claim producing generation `1`; every
+later claim incrementing exactly once; two PostgreSQL claimers receiving distinct generations;
+atomic increment under real PostgreSQL concurrency; signed-BIGINT overflow failing before mutation
+without aborting the transaction; `processing_started_at` backfill, status constraint, index, and
+recovery-query migration tests; automatic retry changing neither cycle nor generation before its
+next claim; stale recovery retaining generation and clearing the timestamp; replay retaining
+generation; worker completion lock/exact-handle validation; at most one worker rejection per cycle;
+worker rejection storing the current generation; idempotent same-handle worker-rejection retry; second replay
+allowing a new worker rejection and the next claim receiving a new generation; history preservation
+for both sources; two concurrent worker-policy-rejection completion calls carrying the same
+immutable handle producing one rejection row and the same rejection ID while both outer
+transactions remain usable, with no attempt/count change; duplicate same-handle success producing
+one attempt and `already-completed` on the second call; duplicate same-handle retryable failure
+producing one attempt, one `attempt_count` increment and one retry transition, with
+`already-completed` on the second call; duplicate same-handle retry-exhausted failure producing one
+attempt and one terminalization, with `already-completed` on the second call; a generation-`1`
+completion arriving after generation `2` exists for the same job/cycle
+returning stale with no mutation and without reusing or returning generation `2`'s rejection; real
+PostgreSQL worker completion/replay/recovery row-lock serialization;
+controlled manual-first/replay-first cycle snapshot interleavings; rejection failure on
+missing/inconsistent locked job state; a concurrent manual and worker rejection coexisting for the
+same cycle; two manual requests creating two records; reuse of the same manual identity creating no
+duplicate and returning the same consistent outcome when metadata matches; concurrent persistence
+with the same manual identity producing one row while both outer transactions remain usable;
+mismatched job, cycle, policy, or safe-reason readback failing closed without `422`; manual
+rejection not setting `job.policy_rejection_id`; the job pointer resolving to its current-cycle
+worker record; tagged execution/processing projections;
+worker PostgreSQL commit/rollback/continuation and fatal-error tests; both public terminal reasons
+and legacy dead-letter serialization; manual route identity generation, tagged result,
+persistence/flush, commit-before-`422`, rollback and no-`422` on commit failure, no attempt,
+unchanged job/status/cycle/count, and raw-resolver/address/target-detail redaction. Add
+fake-monotonic-budget tests for delayed DB/pool/statement work consuming the remaining 40-second
+claim budget, refusal to start work after exhaustion, one-at-a-time claim ordering, and two-worker
+controlled regressions for one active long delivery and a later/last eligible job remaining pending
+without parallel HTTP or duplicates. Add the exact worker A generation `1` -> recovery -> worker B
+generation `2` -> late A completion scenario: A cannot mutate the job, create an attempt, or create
+a rejection; B can complete; the batch continues after A's stale outcome. Add the variant where A
+returns after recovery but before B's claim, and a recovery-versus-completion race using real
+PostgreSQL row locks. Verify all attempt success/failure, retry, terminal, and policy-rejection
+paths share the same fence; `job.policy_rejection_id` resolves to the worker record with the same
+job, cycle, and generation; stale outcomes are not automatically retried and observability is
+redacted. Verify coordinated-deployment guards reject or prevent legacy job-ID-only worker
+operation. Add a rollout/operations test or executable deployment check proving workers are drained
+before constraint enforcement and handle-aware workers are the only workers resumed; document the
+expected API/manual-delivery maintenance behavior for the chosen migration procedure.
 
 ### Follow-up 1 documentation
 
@@ -353,19 +1040,21 @@ Update database, delivery execution, manual API, architecture, and changelog doc
 
 ### Follow-up 1 non-goals
 
-No resolver/transport, new job status, fake attempt, endpoint preflight, or proxy support.
+No resolver/transport, new job status, fake attempt, endpoint preflight, proxy support, parallel
+worker execution, or exactly-once guarantee.
 
 ### Follow-up 1 validation commands
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -m pytest -W error -p no:cacheprovider tests/test_migrations.py tests/test_delivery_job_execution_service.py tests/test_delivery_processing_service.py tests/test_delivery_service_transaction_integration.py tests/test_manual_delivery_api.py tests/test_delivery_job_recovery_service.py tests/test_replay_service.py
+& ".\.venv\Scripts\python.exe" -m pytest -W error -p no:cacheprovider tests/test_migrations.py tests/test_delivery_job_execution_service.py tests/test_delivery_processing_service.py tests/test_worker_iteration_service.py tests/test_worker_iteration_service_integration.py tests/test_delivery_service_transaction_integration.py tests/test_manual_delivery_api.py tests/test_delivery_job_recovery_service.py tests/test_replay_service.py
 & ".\.venv\Scripts\python.exe" -m ruff check migrations src tests
 & ".\.venv\Scripts\python.exe" -m mypy src
 ```
 
 ### Follow-up 1 dependencies
 
-Depends on issue #57's decision. Blocks follow-up 2.
+Depends on issue #57's decision. Blocks follow-up 2: the transport work consumes this issue's
+just-in-time ownership and remaining claim-budget boundary.
 
 ## Follow-up draft 2
 
@@ -381,10 +1070,29 @@ and peer inspection while retaining Host, SNI, and certificate verification.
 ### Follow-up 2 scope
 
 - Implement shared URL/address policy and stable rejection reasons.
+- Enforce the normative special-use table above for IPv4, IPv6, literal hosts, every DNS answer,
+  and embedded IPv4 in IPv4-mapped IPv6. Do not substitute an untested `is_global` check.
+- Reject URL userinfo and port `0`; allow ports `1..65535`, including non-default ports, under the
+  same destination, deadline, proxy, and connection rules.
 - Implement `httpx2.BaseTransport` backed by
   `httpcore2.ConnectionPool(network_backend=...)`; never use `HTTPTransport._pool`.
 - Resolve once per new connection, validate all normalized answers, dial snapshot addresses only,
   restrict fallback, and verify peer before write.
+- Normalize, deterministically order, and deduplicate before enforcing 8-by-default/32-maximum
+  resolved addresses. Reject overflow rather than truncate. Enforce 4-by-default/8-maximum connect
+  attempts, never exceeding the address limit.
+- Treat the existing 10-second `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` default as one monotonic budget
+  across resolution, validation, every dial, TLS, request, and response. Pass only remaining time
+  and start no operation at zero.
+- Consume follow-up 1's just-in-time one-job ownership and remaining claim-to-completion budget.
+  Execution receives the approved immutable
+  `ClaimHandle(job_id, delivery_cycle, claim_generation)`. The persistence/application service,
+  not the transport adapter, validates that handle immediately before DNS/HTTP and releases its
+  database resources before network work. The transport receives claim context only for bounded
+  execution/observability; it does not own job-state validation or persistence. It gets the lesser
+  of its 10-second deadline and the remaining 40-second claim budget and starts no resolution or
+  connection work after exhaustion. Follow-up 2 does not restore bulk claim or own job-state
+  transactions.
 - Bind the snapshot to the physical connection, never a hostname cache. Until reconnect/expiry
   ownership is proven, configure `max_keepalive_connections=0` and do not retry transparently.
 - Read and normalize the real synchronous backend's `server_addr`; fail closed before write if
@@ -396,13 +1104,27 @@ and peer inspection while retaining Host, SNI, and certificate verification.
 - Construct client/transport with `trust_env=False` and no implicit proxy route.
 - Integrate follow-up 1's rejection transaction behavior.
 - Document and test an explicit keepalive/snapshot-lifetime policy.
-- Because production will import `httpcore2` directly, add it as a direct dependency constrained to
-  the verified 2.9 API line (`httpcore2>=2.9.1,<2.10`) and document the deliberate compatibility
-  upgrade procedure rather than relying on httpx2's transitive resolution.
+- Because production will import `httpcore2` directly, select and lock one exact compatible
+  `httpx2`/`httpcore2` pair, initially `2.9.1`/`2.9.1`, and test that exact pair. Do not claim
+  compatibility from SemVer ranges alone. Private APIs remain forbidden; upgrading either package
+  independently requires the real transport integration suite against the resulting exact pair.
 
 ### Follow-up 2 acceptance criteria
 
 - Denied/mixed answers reject durably before connection; no second lookup occurs.
+- Duplicate answers are removed before the address limit; overflow rejects without dial; connect
+  attempts never exceed their cap and use deterministic family/numeric ordering.
+- Resolution, validation, all fallback, TLS, request, and response share one monotonic deadline;
+  remaining budget decreases, and no dial starts after exhaustion. Errors are stable and redact
+  resolved IPs and resolver detail.
+- With two workers, a long-running delivery that remains within the 40-second claim budget is not
+  recovered while active. A later/last eligible job remains `pending` until its turn, then enters
+  HTTP under a fresh claim budget. These controlled cases produce neither parallel HTTP nor a
+  duplicate delivery; they do not remove the existing at-least-once crash window.
+- With worker A at generation `1`, recovery, and worker B at generation `2`, late A cannot mutate
+  the job or terminalize it. If A is already stale before pre-request validation, it performs no
+  DNS or HTTP. If A's HTTP occurred before recovery, the remote effect remains possible but stale
+  completion is still rejected; this is explicitly at-least-once behavior.
 - Every dial is numeric and in snapshot; fallback cannot escape it.
 - Denied/mismatched peer fails before write.
 - Reconnect or expiry cannot reuse a hostname-level snapshot; each physical connection has one
@@ -412,16 +1134,31 @@ and peer inspection while retaining Host, SNI, and certificate verification.
 - Policy signals retain their type and safe metadata through the adapter, are never normalized as
   transport errors, and contain no sensitive exception/address detail.
 - Manual/worker paths share policy but retain distinct state mutation.
-- `httpcore2` is a direct versioned dependency, and dependency upgrades have a public-seam and
-  real-`server_addr` compatibility test.
+- The exact compatible `httpx2`/`httpcore2` pair is directly declared and tested. Any one-package
+  upgrade reruns public-seam, real connection, TLS, proxy, and `server_addr` integration tests;
+  production uses no private API.
 
 ### Follow-up 2 tests
 
-Add deterministic cases based on the PoC for IPv4/IPv6 normalization, mapped addresses, mixed
-answers, fallback, peer mismatch, TLS identity, per-connection snapshot ownership, timeout/error
-mapping, typed-signal bypass, and proxy isolation. Add controlled local-server tests for real
-`server_addr`, missing/malformed peer fail-closed behavior, reconnect/expiry, and worker/manual
-rejection integrations. Use no public internet.
+Add table-driven tests for every normative IPv4/IPv6 class, mapped-address embedded classification,
+literal hosts, userinfo, port `0`, and non-default ports. Add deterministic fake-clock tests for
+one deadline across resolution and every fallback, address-count and connect-attempt limits, no
+dial after exhaustion, deterministic snapshot-only fallback, peer mismatch, TLS identity,
+per-connection snapshot ownership, timeout/error mapping, typed-signal bypass, and proxy isolation.
+Add controlled real-transport tests for `server_addr`, peer-before-first-write, real TLS hostname
+verification, reconnect/expiry, HTTP/2 disabled behavior, HTTP/HTTPS/SOCKS rejection, and
+`trust_env=False`; use no public internet. Verify delayed preparation leaves the transport only the
+remaining claim budget. Add two controlled two-worker PostgreSQL regressions: one long-running
+active delivery within 40 seconds, and one later/last eligible job that remains pending behind
+prior deliveries before receiving a fresh just-in-time claim and entering HTTP. Prove the active
+job is not prematurely recovered and neither controlled case runs HTTP concurrently or delivers
+twice, without asserting exactly-once across process failure. Test the exact dependency pair.
+Add the claim-fencing transport regression with worker A generation `1`, recovery, worker B
+generation `2`, and late A: persistence-owned pre-request validation prevents stale A from
+starting DNS/HTTP when observed in time; completion validation prevents every late A job mutation,
+attempt, rejection, or terminalization; B remains able to complete. Include the explicit variant
+where A's HTTP happened before recovery and assert only stale completion rejection, not reversal of
+the remote effect or exactly-once behavior.
 
 ### Follow-up 2 documentation
 
@@ -436,15 +1173,18 @@ No endpoint preflight, redirects, arbitrary proxies, protocol rewrite, or privat
 
 ```powershell
 & ".\.venv\Scripts\python.exe" -m pytest -W error -p no:cacheprovider tests/experimental/test_webhook_ssrf_boundary_spike.py tests/test_delivery_http.py tests/test_delivery_processing_service.py
-& ".\.venv\Scripts\python.exe" -c "import httpcore2; assert httpcore2.__version__.startswith('2.9.')"
+& ".\.venv\Scripts\python.exe" -c "import httpx2,httpcore2; assert (httpx2.__version__,httpcore2.__version__)==('2.9.1','2.9.1')"
 & ".\.venv\Scripts\python.exe" -m ruff check src tests
 & ".\.venv\Scripts\python.exe" -m mypy src
 ```
 
 ### Follow-up 2 dependencies
 
-Depends on follow-up 1. It must add and verify the direct `httpcore2>=2.9.1,<2.10` dependency
-alongside compatible `httpx2`, then lock that public-seam evidence into tests. Blocks follow-up 3.
+Depends on follow-up 1's tagged outcomes, rejection persistence, immutable claim handle,
+persistence-owned pre-request/completion validation, just-in-time one-job claim, and remaining
+claim-budget boundary. It must declare and verify an exact compatible pair for both packages and
+lock public-seam and real-transport evidence into tests. The transport adapter must not own or
+mutate `claim_generation`. Blocks follow-up 3.
 
 ## Follow-up draft 3
 
@@ -460,23 +1200,32 @@ invalid/currently forbidden destinations early without exposing network detail.
 ### Follow-up 3 scope
 
 - Reuse follow-up 2's exact parser/address policy during endpoint creation.
-- Perform non-authoritative current DNS preflight without dialing.
+- Perform advisory current DNS preflight without dialing. Delivery-time enforcement remains the
+  only authoritative decision and always re-resolves through the guarded boundary.
 - Return stable safe errors without internal IPs, resolver detail, or exception text.
 - Keep connection-time re-resolution/enforcement; successful preflight is not authorization cache.
-- Decide explicitly whether creation rejection also gets follow-up 1's manual audit record.
+- A rejected creation persists no endpoint and no destination-policy rejection record because no
+  endpoint, event, or job exists. Do not create an artificial durable domain entity solely for
+  audit. Optional redacted log/metric telemetry is not durable domain audit history.
+- Define resolver unavailability as a safe, retryable creation failure with deterministic status
+  and response; do not treat unavailable DNS as authorization or silently accept it.
 
 ### Follow-up 3 acceptance criteria
 
 - Invalid scheme, credentials, port, empty/malformed answers, and any denied answer reject.
 - Errors are stable and redact address/resolver data.
 - Passing preflight never bypasses connection-bound policy or pins stale DNS.
+- Rejected preflight creates no endpoint or durable rejection record. Optional telemetry contains
+  no target IP, credentials, resolver exception, or internal details.
 - Existing successful endpoint response remains compatible.
-- Resolver failure has safe classification and retry guidance.
+- Resolver failure has safe deterministic classification and explicit retry guidance; delivery-time
+  enforcement remains authoritative after every successful creation.
 
 ### Follow-up 3 tests
 
-Endpoint service/API allowed, denied, mixed, malformed, empty, and resolver-failure tests with
-redaction assertions; regression proving delivery still performs authoritative enforcement.
+Offline resolver test doubles for endpoint service/API allowed, denied, mixed, malformed, empty,
+and unavailable answers; userinfo/port cases; redaction and no-persistence assertions; regression
+proving delivery still performs authoritative enforcement. No real network is used.
 
 ### Follow-up 3 documentation
 
@@ -498,5 +1247,5 @@ guarantee, redirect, or proxy support.
 
 ### Follow-up 3 dependencies
 
-Depends on follow-up 2's shared policy/taxonomy and on follow-up 1 if creation rejections are
-persisted.
+Depends on follow-up 2's shared policy/taxonomy and guarded delivery boundary. It does not depend
+on follow-up 1 persistence because creation rejections are deliberately not durable domain records.

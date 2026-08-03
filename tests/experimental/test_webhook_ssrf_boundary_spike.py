@@ -20,6 +20,19 @@ Resolver = Callable[[str], tuple[str, ...]]
 AddressPolicy = Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]
 
 
+class _FakeClock:
+    """Deterministic monotonic clock; it never reads or sleeps system time."""
+
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 @dataclass(frozen=True)
 class _Snapshot:
     hostname: str
@@ -86,16 +99,22 @@ class _OfflineNumericDialer:
         failing_addresses: Iterable[str] = (),
         peer_overrides: dict[str, str] | None = None,
         responses_per_connection: int = 2,
+        clock: _FakeClock | None = None,
+        connect_costs: dict[str, float] | None = None,
     ) -> None:
         self.events = events
         self.failing_addresses = set(failing_addresses)
         self.peer_overrides = peer_overrides or {}
         self.responses_per_connection = responses_per_connection
+        self.clock = clock or _FakeClock()
+        self.connect_costs = connect_costs or {}
 
-    def connect(self, address: str, port: int) -> _OfflineStream:
+    def connect(self, address: str, port: int, *, timeout: float) -> _OfflineStream:
         # Parsing proves the boundary passes a numeric literal, not a DNS name.
         ipaddress.ip_address(address)
+        self.events.append(f"dial_budget:{timeout:.1f}")
         self.events.append(f"dial:{address}:{port}")
+        self.clock.advance(self.connect_costs.get(address, 0.0))
         if address in self.failing_addresses:
             self.events.append(f"dial_failed:{address}")
             raise httpcore2.ConnectError(f"offline failure for {address}")
@@ -113,14 +132,18 @@ class _SnapshotNetworkBackend(httpcore2.NetworkBackend):
         dialer: _OfflineNumericDialer,
         policy: AddressPolicy,
         events: list[str],
+        clock: _FakeClock,
+        max_connect_attempts: int,
     ) -> None:
         self.dialer = dialer
         self.policy = policy
         self.events = events
-        self.snapshots: dict[str, _Snapshot] = {}
+        self.clock = clock
+        self.max_connect_attempts = max_connect_attempts
+        self.snapshots: dict[str, tuple[_Snapshot, float]] = {}
 
-    def bind(self, snapshot: _Snapshot) -> None:
-        self.snapshots[snapshot.hostname] = snapshot
+    def bind(self, snapshot: _Snapshot, deadline: float) -> None:
+        self.snapshots[snapshot.hostname] = (snapshot, deadline)
 
     def connect_tcp(
         self,
@@ -130,11 +153,15 @@ class _SnapshotNetworkBackend(httpcore2.NetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[httpcore2.SOCKET_OPTION] | None = None,
     ) -> httpcore2.NetworkStream:
-        snapshot = self.snapshots[host]
+        snapshot, deadline = self.snapshots[host]
         last_error: httpcore2.ConnectError | None = None
-        for address in snapshot.addresses:
+        for address in snapshot.addresses[: self.max_connect_attempts]:
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                self.events.append("deadline_exhausted_before_dial")
+                raise httpcore2.ConnectTimeout("shared delivery deadline exhausted")
             try:
-                stream = self.dialer.connect(address, port)
+                stream = self.dialer.connect(address, port, timeout=remaining)
             except httpcore2.ConnectError as error:
                 last_error = error
                 continue
@@ -169,13 +196,26 @@ class _SpikeTransport(httpx2.BaseTransport):
         dialer: _OfflineNumericDialer,
         events: list[str],
         max_keepalive_connections: int = 10,
+        clock: _FakeClock | None = None,
+        delivery_deadline_seconds: float = 10.0,
+        max_resolved_addresses: int = 8,
+        max_connect_attempts: int = 4,
     ) -> None:
         self.resolver = resolver
         self.policy = policy
         self.events = events
         self.keepalive = max_keepalive_connections != 0
+        self.clock = clock or dialer.clock
+        self.delivery_deadline_seconds = delivery_deadline_seconds
+        self.max_resolved_addresses = max_resolved_addresses
         self.snapshots: dict[str, _Snapshot] = {}
-        self.backend = _SnapshotNetworkBackend(dialer=dialer, policy=policy, events=events)
+        self.backend = _SnapshotNetworkBackend(
+            dialer=dialer,
+            policy=policy,
+            events=events,
+            clock=self.clock,
+            max_connect_attempts=max_connect_attempts,
+        )
         self.ssl_context = ssl.create_default_context()
         self.pool = httpcore2.ConnectionPool(
             ssl_context=self.ssl_context,
@@ -185,29 +225,44 @@ class _SpikeTransport(httpx2.BaseTransport):
             http2=False,
         )
 
-    def _snapshot(self, hostname: str) -> _Snapshot:
+    def _snapshot(self, hostname: str, deadline: float) -> _Snapshot:
         if self.keepalive and hostname in self.snapshots:
             self.events.append(f"snapshot_reused:{hostname}")
             return self.snapshots[hostname]
 
         self.events.append(f"resolve:{hostname}")
         addresses = self.resolver(hostname)
+        if deadline - self.clock() <= 0:
+            raise httpx2.ConnectTimeout("shared delivery deadline exhausted")
         if not addresses:
             raise httpx2.ConnectError("resolver returned no addresses")
-        for value in addresses:
+        normalized = tuple(
+            str(address)
+            for address in sorted(
+                {ipaddress.ip_address(value) for value in addresses},
+                key=lambda address: (address.version, address.packed),
+            )
+        )
+        if len(normalized) > self.max_resolved_addresses:
+            raise httpx2.ConnectError("resolver snapshot exceeded the safe address limit")
+        denied = False
+        for value in normalized:
             address = ipaddress.ip_address(value)
             self.events.append(f"validate:{address}")
             if not self.policy(address):
-                raise httpx2.ConnectError("resolver snapshot contained a denied address")
-        snapshot = _Snapshot(hostname=hostname, addresses=addresses)
+                denied = True
+        if denied:
+            raise httpx2.ConnectError("resolver snapshot contained a denied address")
+        snapshot = _Snapshot(hostname=hostname, addresses=normalized)
         if self.keepalive:
             self.snapshots[hostname] = snapshot
-        self.backend.bind(snapshot)
+        self.backend.bind(snapshot, deadline)
         return snapshot
 
     def handle_request(self, request: httpx2.Request) -> httpx2.Response:
         hostname = request.url.host
-        self._snapshot(hostname)
+        deadline = self.clock() + self.delivery_deadline_seconds
+        self._snapshot(hostname, deadline)
         core_request = httpcore2.Request(
             method=request.method,
             url=httpcore2.URL(
@@ -269,8 +324,8 @@ def test_all_addresses_are_validated_fail_closed_before_any_dial() -> None:
 
     assert events == [
         "resolve:hooks.example.test",
-        "validate:203.0.113.10",
         "validate:127.0.0.1",
+        "validate:203.0.113.10",
     ]
 
 
@@ -405,3 +460,163 @@ def test_trust_env_false_does_not_consult_environment_proxy_discovery(
 
     assert "dial:203.0.113.10:443" in events
     assert all("127.0.0.1" not in event for event in events)
+
+
+def test_one_fake_clock_budget_covers_resolution_and_all_fallback_attempts() -> None:
+    events: list[str] = []
+    resolver_calls = 0
+    clock = _FakeClock()
+
+    def resolver(hostname: str) -> tuple[str, ...]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        clock.advance(2.0)
+        return ("203.0.113.10", "203.0.113.11", "203.0.113.12")
+
+    dialer = _OfflineNumericDialer(
+        events=events,
+        failing_addresses={"203.0.113.10", "203.0.113.11", "203.0.113.12"},
+        clock=clock,
+        connect_costs={"203.0.113.10": 5.0, "203.0.113.11": 5.0},
+    )
+    transport = _SpikeTransport(
+        resolver=resolver,
+        policy=_policy("203.0.113.10", "203.0.113.11", "203.0.113.12"),
+        dialer=dialer,
+        events=events,
+        clock=clock,
+        delivery_deadline_seconds=10.0,
+    )
+
+    with httpx2.Client(transport=transport, trust_env=False) as client:
+        with pytest.raises(httpcore2.ConnectTimeout, match="shared delivery deadline"):
+            _post(client)
+
+    assert resolver_calls == 1
+    assert [event for event in events if event.startswith("dial_budget:")] == [
+        "dial_budget:8.0",
+        "dial_budget:3.0",
+    ]
+    assert "dial:203.0.113.12:443" not in events
+    assert events[-1] == "deadline_exhausted_before_dial"
+
+
+def test_default_connect_attempt_limit_is_exactly_four() -> None:
+    events: list[str] = []
+    resolver_calls = 0
+
+    def resolver(hostname: str) -> tuple[str, ...]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return (
+            "203.0.113.10",
+            "203.0.113.11",
+            "203.0.113.12",
+            "203.0.113.13",
+            "203.0.113.14",
+        )
+
+    dialer = _OfflineNumericDialer(
+        events=events,
+        failing_addresses={
+            "203.0.113.10",
+            "203.0.113.11",
+            "203.0.113.12",
+            "203.0.113.13",
+        },
+    )
+    transport = _SpikeTransport(
+        resolver=resolver,
+        policy=_policy(
+            "203.0.113.10",
+            "203.0.113.11",
+            "203.0.113.12",
+            "203.0.113.13",
+            "203.0.113.14",
+        ),
+        dialer=dialer,
+        events=events,
+    )
+
+    with httpx2.Client(transport=transport, trust_env=False) as client:
+        with pytest.raises(httpcore2.ConnectError, match="offline failure"):
+            _post(client)
+
+    assert resolver_calls == 1
+    assert [event for event in events if event.startswith("dial:")] == [
+        "dial:203.0.113.10:443",
+        "dial:203.0.113.11:443",
+        "dial:203.0.113.12:443",
+        "dial:203.0.113.13:443",
+    ]
+    assert "dial:203.0.113.14:443" not in events
+
+
+def test_default_address_limit_deduplicates_raw_answers_before_counting() -> None:
+    events: list[str] = []
+    resolver_calls = 0
+
+    def resolver(hostname: str) -> tuple[str, ...]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return (
+            "203.0.113.10",
+            "203.0.113.10",
+            "203.0.113.11",
+            "203.0.113.12",
+            "203.0.113.13",
+            "203.0.113.14",
+            "203.0.113.15",
+            "203.0.113.16",
+            "203.0.113.17",
+        )
+
+    dialer = _OfflineNumericDialer(events=events)
+    transport = _SpikeTransport(
+        resolver=resolver,
+        policy=_policy(
+            "203.0.113.10",
+            "203.0.113.11",
+            "203.0.113.12",
+            "203.0.113.13",
+            "203.0.113.14",
+            "203.0.113.15",
+            "203.0.113.16",
+            "203.0.113.17",
+        ),
+        dialer=dialer,
+        events=events,
+    )
+
+    with httpx2.Client(transport=transport, trust_env=False) as client:
+        assert _post(client).status_code == 204
+
+    assert resolver_calls == 1
+    assert len([event for event in events if event.startswith("validate:")]) == 8
+    assert events.count("validate:203.0.113.10") == 1
+    assert "dial:203.0.113.10:443" in events
+
+
+def test_nine_unique_addresses_exceed_default_limit_before_any_dial() -> None:
+    events: list[str] = []
+    resolver_calls = 0
+
+    def resolver(hostname: str) -> tuple[str, ...]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return tuple(f"203.0.113.{value}" for value in range(10, 19))
+
+    dialer = _OfflineNumericDialer(events=events)
+    transport = _SpikeTransport(
+        resolver=resolver,
+        policy=_policy(*(f"203.0.113.{value}" for value in range(10, 19))),
+        dialer=dialer,
+        events=events,
+    )
+
+    with httpx2.Client(transport=transport, trust_env=False) as client:
+        with pytest.raises(httpx2.ConnectError, match="safe address limit"):
+            _post(client)
+
+    assert resolver_calls == 1
+    assert events == ["resolve:hooks.example.test"]
