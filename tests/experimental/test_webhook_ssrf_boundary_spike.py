@@ -1,7 +1,8 @@
-"""Experimental, offline PoC for binding DNS policy to webhook connections.
+"""Experimental, offline PoC for SSRF snapshots and completion classification.
 
 This is deliberately test-local. It characterizes public httpx2/httpcore2 seams and
-must not be imported by production code.
+pure classification semantics, and must not be imported by production code. It uses
+no database, sockets, system DNS, sleep, system clock, real TLS, proxy, or HTTP/2.
 """
 
 from __future__ import annotations
@@ -9,15 +10,19 @@ from __future__ import annotations
 import ipaddress
 import ssl
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import httpcore2
 import httpx2
 import pytest
 
-Resolver = Callable[[str], tuple[str, ...]]
+Resolver = Callable[[str], Iterable[str]]
 AddressPolicy = Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]
+
+MAX_RAW_RESOLVER_RECORDS = 32
+MAX_NORMALIZED_ADDRESSES = 8
+MAX_CONNECT_ATTEMPTS = 4
 
 
 class _FakeClock:
@@ -37,6 +42,72 @@ class _FakeClock:
 class _Snapshot:
     hostname: str
     addresses: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ClaimHandle:
+    job_id: int
+    delivery_cycle: int
+    claim_generation: int
+
+
+@dataclass(frozen=True)
+class _CompletionJob:
+    """Minimal durable state used only to prove locked classification semantics."""
+
+    job_id: int
+    delivery_cycle: int
+    claim_generation: int
+    status: str
+    processing_started: bool
+    last_completed_delivery_cycle: int | None = None
+    last_completed_claim_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        cycle_is_null = self.last_completed_delivery_cycle is None
+        generation_is_null = self.last_completed_claim_generation is None
+        if cycle_is_null != generation_is_null:
+            raise ValueError("completion marker fields must be null or non-null together")
+
+
+def _classify_completion(job: _CompletionJob, incoming: _ClaimHandle) -> str:
+    """Model the four ordered checks performed under SELECT ... FOR UPDATE."""
+
+    if (
+        incoming.job_id != job.job_id
+        or incoming.delivery_cycle != job.delivery_cycle
+        or incoming.claim_generation != job.claim_generation
+    ):
+        return "stale-claim"
+    if job.status == "processing" and job.processing_started:
+        return "active-processing-claim"
+    if (
+        job.status != "processing"
+        and job.last_completed_delivery_cycle == incoming.delivery_cycle
+        and job.last_completed_claim_generation == incoming.claim_generation
+    ):
+        return "already-completed"
+    return "stale-claim"
+
+
+def _interleave_addresses(
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address],
+) -> tuple[str, ...]:
+    ipv4 = sorted(
+        (address for address in addresses if address.version == 4),
+        key=lambda address: address.packed,
+    )
+    ipv6 = sorted(
+        (address for address in addresses if address.version == 6),
+        key=lambda address: address.packed,
+    )
+    ordered: list[str] = []
+    for offset in range(max(len(ipv4), len(ipv6))):
+        if offset < len(ipv4):
+            ordered.append(str(ipv4[offset]))
+        if offset < len(ipv6):
+            ordered.append(str(ipv6[offset]))
+    return tuple(ordered)
 
 
 class _FakeSSLObject:
@@ -198,8 +269,9 @@ class _SpikeTransport(httpx2.BaseTransport):
         max_keepalive_connections: int = 10,
         clock: _FakeClock | None = None,
         delivery_deadline_seconds: float = 10.0,
-        max_resolved_addresses: int = 8,
-        max_connect_attempts: int = 4,
+        max_raw_resolver_records: int = MAX_RAW_RESOLVER_RECORDS,
+        max_resolved_addresses: int = MAX_NORMALIZED_ADDRESSES,
+        max_connect_attempts: int = MAX_CONNECT_ATTEMPTS,
     ) -> None:
         self.resolver = resolver
         self.policy = policy
@@ -207,6 +279,7 @@ class _SpikeTransport(httpx2.BaseTransport):
         self.keepalive = max_keepalive_connections != 0
         self.clock = clock or dialer.clock
         self.delivery_deadline_seconds = delivery_deadline_seconds
+        self.max_raw_resolver_records = max_raw_resolver_records
         self.max_resolved_addresses = max_resolved_addresses
         self.snapshots: dict[str, _Snapshot] = {}
         self.backend = _SnapshotNetworkBackend(
@@ -231,18 +304,16 @@ class _SpikeTransport(httpx2.BaseTransport):
             return self.snapshots[hostname]
 
         self.events.append(f"resolve:{hostname}")
-        addresses = self.resolver(hostname)
+        raw_addresses: list[str] = []
+        for record_number, value in enumerate(self.resolver(hostname), start=1):
+            if record_number > self.max_raw_resolver_records:
+                raise httpx2.ConnectError("resolver answer exceeded the safe raw record limit")
+            raw_addresses.append(value)
         if deadline - self.clock() <= 0:
             raise httpx2.ConnectTimeout("shared delivery deadline exhausted")
-        if not addresses:
+        if not raw_addresses:
             raise httpx2.ConnectError("resolver returned no addresses")
-        normalized = tuple(
-            str(address)
-            for address in sorted(
-                {ipaddress.ip_address(value) for value in addresses},
-                key=lambda address: (address.version, address.packed),
-            )
-        )
+        normalized = _interleave_addresses({ipaddress.ip_address(value) for value in raw_addresses})
         if len(normalized) > self.max_resolved_addresses:
             raise httpx2.ConnectError("resolver snapshot exceeded the safe address limit")
         denied = False
@@ -552,24 +623,14 @@ def test_default_connect_attempt_limit_is_exactly_four() -> None:
     assert "dial:203.0.113.14:443" not in events
 
 
-def test_default_address_limit_deduplicates_raw_answers_before_counting() -> None:
+def test_exactly_32_duplicate_heavy_raw_records_deduplicate_within_unique_limit() -> None:
     events: list[str] = []
     resolver_calls = 0
 
     def resolver(hostname: str) -> tuple[str, ...]:
         nonlocal resolver_calls
         resolver_calls += 1
-        return (
-            "203.0.113.10",
-            "203.0.113.10",
-            "203.0.113.11",
-            "203.0.113.12",
-            "203.0.113.13",
-            "203.0.113.14",
-            "203.0.113.15",
-            "203.0.113.16",
-            "203.0.113.17",
-        )
+        return tuple(f"203.0.113.{value}" for value in range(10, 18)) * 4
 
     dialer = _OfflineNumericDialer(events=events)
     transport = _SpikeTransport(
@@ -597,6 +658,97 @@ def test_default_address_limit_deduplicates_raw_answers_before_counting() -> Non
     assert "dial:203.0.113.10:443" in events
 
 
+def test_33_duplicate_raw_records_fail_closed_without_snapshot_dial_or_write() -> None:
+    events: list[str] = []
+    yielded_records = 0
+
+    def resolver(hostname: str) -> Iterable[str]:
+        nonlocal yielded_records
+        for _ in range(40):
+            yielded_records += 1
+            yield "203.0.113.10"
+
+    dialer = _OfflineNumericDialer(events=events)
+    transport = _SpikeTransport(
+        resolver=resolver,
+        policy=_policy("203.0.113.10"),
+        dialer=dialer,
+        events=events,
+    )
+
+    with httpx2.Client(transport=transport, trust_env=False) as client:
+        with pytest.raises(httpx2.ConnectError, match="raw record limit"):
+            _post(client)
+
+    assert yielded_records == 33
+    assert events == ["resolve:hooks.example.test"]
+    assert transport.snapshots == {}
+
+
+def test_mixed_family_round_robin_precedes_attempt_cap_and_stays_in_snapshot() -> None:
+    events: list[str] = []
+    resolver_calls = 0
+
+    def resolver(hostname: str) -> tuple[str, ...]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return (
+            "192.0.2.40",
+            "2001:db8::20",
+            "192.0.2.20",
+            "192.0.2.10",
+            "2001:db8::10",
+            "192.0.2.30",
+            "192.0.2.10",
+        )
+
+    approved = (
+        "192.0.2.10",
+        "192.0.2.20",
+        "192.0.2.30",
+        "192.0.2.40",
+        "2001:db8::10",
+        "2001:db8::20",
+    )
+    dialer = _OfflineNumericDialer(
+        events=events,
+        failing_addresses={"192.0.2.10", "2001:db8::10", "192.0.2.20"},
+    )
+    transport = _SpikeTransport(
+        resolver=resolver,
+        policy=_policy(*approved),
+        dialer=dialer,
+        events=events,
+    )
+
+    with httpx2.Client(transport=transport, trust_env=False) as client:
+        assert _post(client).status_code == 204
+
+    expected_snapshot = (
+        "192.0.2.10",
+        "2001:db8::10",
+        "192.0.2.20",
+        "2001:db8::20",
+        "192.0.2.30",
+        "192.0.2.40",
+    )
+    assert transport.snapshots["hooks.example.test"].addresses == expected_snapshot
+    assert transport.backend.max_connect_attempts == MAX_CONNECT_ATTEMPTS
+    assert resolver_calls == 1
+    assert [event for event in events if event.startswith("dial:")] == [
+        "dial:192.0.2.10:443",
+        "dial:2001:db8::10:443",
+        "dial:192.0.2.20:443",
+        "dial:2001:db8::20:443",
+    ]
+    assert "dial:192.0.2.30:443" not in events
+    assert all(
+        event.removeprefix("dial:").removesuffix(":443") in expected_snapshot
+        for event in events
+        if event.startswith("dial:")
+    )
+
+
 def test_nine_unique_addresses_exceed_default_limit_before_any_dial() -> None:
     events: list[str] = []
     resolver_calls = 0
@@ -620,3 +772,58 @@ def test_nine_unique_addresses_exceed_default_limit_before_any_dial() -> None:
 
     assert resolver_calls == 1
     assert events == ["resolve:hooks.example.test"]
+
+
+def test_completion_marker_distinguishes_accepted_retry_from_recovery() -> None:
+    handle = _ClaimHandle(job_id=41, delivery_cycle=0, claim_generation=7)
+    accepted_retry = _CompletionJob(
+        job_id=41,
+        delivery_cycle=0,
+        claim_generation=7,
+        status="pending",
+        processing_started=False,
+        last_completed_delivery_cycle=0,
+        last_completed_claim_generation=7,
+    )
+    recovered = _CompletionJob(
+        job_id=41,
+        delivery_cycle=0,
+        claim_generation=7,
+        status="pending",
+        processing_started=False,
+    )
+
+    assert _classify_completion(accepted_retry, handle) == "already-completed"
+    assert _classify_completion(recovered, handle) == "stale-claim"
+
+
+def test_newer_claim_generation_fences_a_historical_completion_marker() -> None:
+    old_handle = _ClaimHandle(job_id=41, delivery_cycle=0, claim_generation=7)
+    reclaimed = _CompletionJob(
+        job_id=41,
+        delivery_cycle=0,
+        claim_generation=8,
+        status="processing",
+        processing_started=True,
+        last_completed_delivery_cycle=0,
+        last_completed_claim_generation=7,
+    )
+
+    assert _classify_completion(reclaimed, old_handle) == "stale-claim"
+
+
+def test_completion_marker_has_pair_nullability_and_no_http_outcome() -> None:
+    marker_fields = {field.name for field in fields(_CompletionJob)}
+
+    assert "last_completed_delivery_cycle" in marker_fields
+    assert "last_completed_claim_generation" in marker_fields
+    assert not any("http" in name or "outcome" in name for name in marker_fields)
+    with pytest.raises(ValueError, match="null or non-null together"):
+        _CompletionJob(
+            job_id=41,
+            delivery_cycle=0,
+            claim_generation=7,
+            status="pending",
+            processing_started=False,
+            last_completed_delivery_cycle=0,
+        )

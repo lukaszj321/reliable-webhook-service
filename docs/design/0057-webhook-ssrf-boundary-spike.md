@@ -47,9 +47,10 @@ jobs aging in a processing queue.
 - Fence every worker-owned persistence path with an immutable claim handle containing `job_id`,
   `delivery_cycle`, and a monotonically increasing `claim_generation`. A timestamp determines claim
   age; it must never substitute for claim identity.
-- Normalize and deduplicate answers before enforcing both an address-count limit and a separate
-  connection-attempt limit. Never silently truncate an oversized answer set. Order approved
-  addresses deterministically by IP family and then packed numeric value.
+- Bound raw resolver iteration before normalization, then normalize, validate, and deduplicate
+  before enforcing the independent unique-address limit. Never silently truncate an oversized
+  answer set. Interleave sorted IPv4 and IPv6 buckets before applying the independent connection-
+  attempt limit, so neither family is starved.
 - Dial only numeric literals from the immutable approved snapshot. Fallback stays within that
   snapshot and performs no second lookup.
 - Preserve the original hostname for HTTP `Host`, TLS SNI, hostname verification, certificate
@@ -85,6 +86,27 @@ fresh timeout for each operation. It adds these bounded settings:
 | `WEBHOOK_WORKER_STALE_SAFETY_MARGIN_SECONDS` | Budget for post-claim preparation, DB/pool waits, completion persistence, and scheduling overhead outside the nested delivery deadline | `30.0` | Finite positive number |
 | `WEBHOOK_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS` | Age after just-in-time claim before the one `processing` job may be recovered | Existing `300.0` | Must be at least the derived claim-to-completion budget, currently `40.0` |
 
+The transport also has the non-negotiable implementation limits
+`MAX_RAW_RESOLVER_RECORDS = 32`, `MAX_NORMALIZED_ADDRESSES = 8`, and
+`MAX_CONNECT_ATTEMPTS = 4`. The raw cap counts every yielded resolver record before
+deduplication, including a duplicate and a value that will later fail normalization. On record 33
+the boundary rejects the entire answer immediately, stops iteration, returns no partial snapshot,
+dials nothing, and performs no HTTP write. For at most 32 records it then normalizes and validates
+every value, deduplicates, rejects more than 8 unique addresses, interleaves the approved families,
+and applies the cap of 4 connection attempts to that interleaved result. The raw cap bounds CPU and
+memory work on duplicate-heavy or malformed answers; the unique cap bounds the immutable approved
+snapshot; the attempt cap bounds connection amplification. All three limits are independent.
+
+Approved-address ordering is exact: normalize and deduplicate; split into IPv4 and IPv6 buckets;
+sort each bucket by packed bytes; then take one item from each available bucket in fixed family
+order IPv4, IPv6, repeating until both are empty. Apply the connection-attempt cap only afterward.
+Thus IPv4 `192.0.2.10`, `192.0.2.20`, `192.0.2.30` and IPv6 `2001:db8::10`,
+`2001:db8::20` produce `192.0.2.10`, `2001:db8::10`, `192.0.2.20`,
+`2001:db8::20`, `192.0.2.30`. Resolver answer order cannot affect this order. When both families
+exist, the first two attempts cover both; four unavailable addresses of either family cannot push
+the other family outside the first four attempts. Interleaving never changes an allow/deny
+decision, and every dial still consumes only the immutable approved numeric snapshot.
+
 Each just-in-time claim starts one monotonic claim-to-completion budget derived as
 `WEBHOOK_DELIVERY_TIMEOUT_SECONDS + WEBHOOK_WORKER_STALE_SAFETY_MARGIN_SECONDS`, currently
 `10.0 + 30.0 = 40.0` seconds. It covers every post-claim preparation step, database/connection-pool
@@ -113,6 +135,34 @@ reset by automatic retry, stale recovery, replay, or terminalization. Every succ
 and returns a fail-closed internal claim-overflow outcome before mutation. It must not rely on a
 database overflow error that aborts the transaction.
 
+It also adds two nullable completion-marker columns:
+
+```sql
+last_completed_delivery_cycle BIGINT NULL,
+last_completed_claim_generation BIGINT NULL,
+CONSTRAINT ck_webhook_delivery_job_last_completed_pair
+CHECK (
+    (last_completed_delivery_cycle IS NULL) =
+    (last_completed_claim_generation IS NULL)
+)
+```
+
+Both values are therefore always simultaneously `NULL` or simultaneously non-`NULL`. Existing
+rows are safely backfilled as `(NULL, NULL)`; migration must not infer an earlier accepted
+completion. Such an unmarked legacy row cannot support duplicate readback and fails closed as
+`stale-claim`. For every accepted worker completion—success, retryable failure transitioning to
+`pending`, retry-exhausted failure, and worker destination-policy rejection—the completion
+transaction sets the pair to its incoming `(delivery_cycle, claim_generation)` atomically under
+the same job row lock that accepts completion. It does so before or atomically with the attempt or
+rejection insert, status transition, `processing_started_at` clear, `next_attempt_at` update, and
+terminal projection. Stale recovery, claim acquisition, retry scheduling outside an accepted
+completion, manual delivery, manual policy rejection, and advisory preflight never set or change
+the pair. Replay increments `delivery_cycle` and may retain the historical pair; the cycle mismatch
+fences it. The next successful claim increments `claim_generation`, so an older handle is stale
+even if it equals the retained historical pair. The marker identifies only the last accepted
+worker completion handle. It stores no HTTP result and does not add outcome identity to
+`WebhookDeliveryAttempt`.
+
 Follow-up 1 also adds nullable `processing_started_at`. Its migration sets it to `updated_at` for
 rows that are `processing` at migration time and to `NULL` for every other row. A database
 constraint enforces `processing_started_at IS NOT NULL` exactly when `status='processing'`.
@@ -138,17 +188,26 @@ outcome, performs no DNS or HTTP, creates no attempt or rejection, mutates no jo
 worker continue its batch. This check narrows but cannot eliminate the race in which recovery
 occurs after validation and while the request is already in flight.
 
-Before any persistent completion change, one shared completion boundary selects the job with
-`SELECT ... FOR UPDATE` and revalidates all three handle fields plus `status='processing'`. Every
-worker persistence path passes through it: successful and failed attempt insertion, retry
-scheduling, transition to `succeeded` or `dead_letter`, and worker policy rejection. The locked
-boundary distinguishes an exact active processing handle, the same retained handle whose accepted
-completion has already changed job state, and an invalidated handle. Only the exact active handle
-may mutate. A handle invalidated by recovery, replay, retry, or another claim returns an internal
-stale-claim outcome and makes no changes: no job update, attempt, rejection, `attempt_count`,
-`next_attempt_at`, terminal reason, or policy pointer. A same-handle job state already written by
-the accepted completion follows the `already-completed` or worker-rejection readback rules below.
-Neither non-mutating result automatically retries the mutation, and the worker continues its batch.
+Before any persistent completion change, one shared boundary selects the job with
+`SELECT ... FOR UPDATE` and classifies the incoming
+`ClaimHandle(job_id, delivery_cycle, claim_generation)` in this exact order:
+
+1. **Current-handle comparison.** If incoming `delivery_cycle` or `claim_generation` differs from
+   the job's current values, return `stale-claim`. Perform no mutation and do not read an outcome
+   belonging to a newer claim.
+2. **Active processing claim.** If the incoming pair matches, `status == processing`, and
+   `processing_started_at IS NOT NULL`, the claim is active and completion may be accepted.
+3. **Accepted duplicate.** If the incoming pair matches, the job is no longer `processing`, and
+   both last-completed fields match the incoming pair, the completion was already accepted. For a
+   worker policy rejection, return exact idempotent rejection readback only when the worker record
+   and job pointer match that same pair. For success, retryable failure, or retry-exhausted failure,
+   return `already-completed`. Perform no mutation and create no attempt or rejection.
+4. **Recovered same-generation claim.** If the incoming pair matches, the job is no longer
+   `processing`, and the last-completed pair does not match, return `stale-claim` with no mutation.
+   This includes recovery changing `processing` to `pending` without accepting completion.
+
+Every worker persistence path passes through this ordered boundary. Neither non-mutating result
+automatically retries mutation; the worker continues its batch.
 
 Completion outcomes have two distinct post-completion contracts. Same-handle idempotent readback
 is required only for a worker policy rejection because that path has a durable rejection record
@@ -178,8 +237,9 @@ without evidence that one is required.
 Stale recovery selects and locks processing rows whose `processing_started_at` exceeds the stale
 threshold, sets them to `pending`, clears `processing_started_at`, and preserves
 `delivery_cycle`, `claim_generation`, and `attempt_count`; it creates no attempt or rejection.
-Changing the status immediately invalidates the old handle. The next claim increments the retained
-generation. Retry scheduling likewise changes `processing -> pending`, clears
+It does not write the last-completed marker, which makes a late same-generation completion
+classifiable as stale. The next claim increments the retained generation. Accepted retry
+scheduling likewise changes `processing -> pending`, clears
 `processing_started_at`, and retains the current generation until the next claim. Valid completion
 to `succeeded` or `dead_letter` also clears `processing_started_at` and retains the last generation.
 
@@ -193,6 +253,16 @@ therefore never reused, including after replay. The required stale sequence is c
 - worker B claims `(delivery_cycle=0, claim_generation=2)`;
 - worker A's completion expects generation `1`, observes `2`, and is rejected as stale;
 - worker B's completion expects and observes generation `2` and may continue.
+
+The marker makes the formerly ambiguous cycle `0`, generation `7` cases durable:
+
+- **Accepted retryable completion:** the worker finishes its request; the locked completion check
+  accepts `(0, 7)`; one failed attempt is inserted; the last-completed pair is set to `(0, 7)`; and
+  the job becomes `pending`. A duplicate completion with `(0, 7)` returns `already-completed`,
+  creates no additional attempt, and performs no additional mutation.
+- **Recovery before completion:** recovery locks and changes the processing job to `pending`, but
+  does not set the pair to `(0, 7)`. The late completion with `(0, 7)` returns `stale-claim`, creates
+  no attempt, and performs no additional mutation.
 
 ### Selected URL and special-use address policy
 
@@ -220,6 +290,16 @@ Follow-up 2 must implement and test this normative policy rather than rely on on
 
 Literal IP hosts pass through the same normalization and table. For DNS names, every answer must
 be allowed; a mixed answer fails closed before dial.
+
+URL host parsing and numeric normalization also fail closed before resolution or dialing. IPv6
+zone identifiers are unsupported and rejected, including bracketed IPv6 with `%zone` and
+percent-encoded scope syntax such as `%25`. Alternate IPv4 textual forms are rejected: integer,
+octal, hexadecimal, mixed-base components, and shortened dotted forms. Tests also cover
+IPv4-mapped IPv6, uppercase and other non-canonical IPv6 spellings, and hosts for which the URL
+parser's normalization is ambiguous. A numeric host is accepted only when it has one unambiguous
+canonical representation. The URL parser, policy classifier, and numeric dialer must never
+interpret the same host differently. Any rejection happens before resolution or dial and therefore
+before an HTTP write. This spike specifies those production tests; it does not implement a parser.
 
 ## Dependency evidence: httpx2/httpcore2 2.9.1
 
@@ -307,7 +387,7 @@ claims below require the deterministic PoC or a future real-backend compatibilit
 | --- | --- | --- | --- | --- | --- |
 | Installed versions | `httpx2 2.9.1` and `httpcore2 2.9.1` | PoC ran with those installed versions | Compatibility with other versions | Re-check and compatibility-test on upgrade | No |
 | Public extension point | `BaseTransport` and `ConnectionPool(network_backend=...)` are public seams | PoC composes both seams | Production adapter integration | Use these seams; do not mutate private `_pool` | No |
-| DNS snapshot validation | Not established by library source | Entire fake answer set is validated before dial | Real resolver integration and answer normalization | Validate every answer and fail closed | No |
+| DNS snapshot validation | Not established by library source | Fake boundary counts raw records, rejects record 33 without a partial snapshot, then normalizes, validates, and deduplicates before dial | Real resolver integration and answer normalization | Enforce independent raw-32 and unique-8 caps and validate every retained answer fail closed | No |
 | Numeric IP dial | Injected backend owns `connect_tcp` | Fake dialer accepts only parsed numeric literals | Real numeric socket connection | Dial only an approved numeric snapshot address | No |
 | No second DNS lookup | Custom backend can own connection establishment | Fake resolver is called once for the characterized connection | System resolver and reconnect behavior | Bind resolution and dial in one connection boundary | No |
 | Host header | Request authority remains the original origin | Wire bytes contain the original `Host` | Real server observation | Preserve original authority | No |
@@ -315,7 +395,7 @@ claims below require the deterministic PoC or a future real-backend compatibilit
 | Certificate hostname verification | Default context enables hostname checking | PoC observes `CERT_REQUIRED` and `check_hostname=True` | Real certificate-chain and hostname validation | Verify certificates against the original hostname | No |
 | Peer metadata | Real synchronous backend exposes `server_addr` | Fake exposes `peername` | Real `server_addr` shape and availability | Normalize real metadata and fail closed when unavailable | No |
 | Peer validation before request bytes | Backend returns the stream before httpcore writes | Fake peer is checked before the first recorded write | Real stream and socket ordering | Validate the real peer before returning a writable stream | No |
-| Fallback | Connection code permits backend-owned connection attempts | Fake fallback stays inside the approved snapshot | Real address-family and socket fallback | Restrict fallback to the immutable approved snapshot | No |
+| Fallback | Connection code permits backend-owned connection attempts | Shuffled duplicate IPv4/IPv6 answers interleave deterministically and fake fallback stays inside the approved snapshot | Real address-family and socket fallback | Round-robin sorted family buckets before the attempt cap; restrict fallback to the snapshot | No |
 | Pooling and keep-alive | Pool assigns and reuses connections by origin | Fake connection reuse and zero-keepalive behavior are observed | Real expiry, remote close, and pool lifecycle | Bind snapshot ownership to each physical connection | No |
 | Reconnect | Reconnection paths exist in the pool/connection code | Not confirmed | Real reconnect after close or expiry | Re-resolve for each replacement connection or disable reuse | No |
 | Concurrency | Public APIs permit shared transport use | Not confirmed | Thread safety, races, and snapshot ownership | Define connection-scoped concurrent ownership | No |
@@ -326,10 +406,11 @@ claims below require the deterministic PoC or a future real-backend compatibilit
 | HTTPS proxy | Standard transport contains an HTTPS proxy branch | Not confirmed | Real HTTPS proxy routing and policy enforcement | Do not support until an equivalent guarded boundary is proven | No |
 | SOCKS proxy | Standard transport contains a SOCKS proxy branch | Not confirmed | Real SOCKS routing and policy enforcement | Do not support until an equivalent guarded boundary is proven | No |
 | Shared deadline model | Current production supplies one timeout value, not an end-to-end budget | Fake clock demonstrates resolution and fallback consuming one decreasing budget | Real resolver, socket, TLS, response, and scheduler timing | Treat `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` as one monotonic end-to-end deadline | No |
-| Address and attempt limits | No production limits exist | PoC deduplicates before rejecting overflow and caps numeric dials | Real transport enforcement | Default to 8 unique answers and 4 attempts with bounded configuration | No |
+| Raw, unique, and attempt limits | No production limits exist | PoC accepts 32 duplicate-heavy records, rejects record 33, caps 8 unique addresses and 4 interleaved dials | Real transport enforcement | Keep raw 32, unique 8, and attempt 4 caps independent | No |
 | Fake clock | Not applicable | Deterministically advances without sleep or system time | Timing fidelity of production operations | Use injectable monotonic time in focused tests | No |
 | Just-in-time single-job claim | Current code bulk-claims up to 100 jobs; it does not implement this contract | Not confirmed | Production job ownership and transaction integration | Claim one due job immediately before execution; leave later jobs pending | No |
 | `claim_generation` schema | Current jobs have no claim-generation field | Not confirmed | Migration, database constraint, overflow handling, and deployed worker compatibility | Add nonnegative monotonic `BIGINT NOT NULL DEFAULT 0`; never reset it | No |
+| Last-completed handle marker | Current jobs have no completion marker | Pure model enforces pair-nullability and distinguishes marked accepted retry from unmarked recovery | Migration, atomic writes, row locks, and rolling deployment | Add the nullable pair; set it only in every accepted worker completion transaction | No |
 | Increment-on-claim | Current claim changes status and `updated_at` only | Not confirmed | Atomic PostgreSQL increment under concurrent claimers | Increment exactly once in the locked `pending -> processing` transaction | No |
 | Immutable claim handle | Current processing carries only job IDs after claim | Not confirmed | Application-service propagation through worker execution | Carry scalar `(job_id, delivery_cycle, claim_generation)` | No |
 | Pre-request claim validation | Current execution begins from a job-ID reload and status check | Not confirmed | Real session lifecycle and recovery race | Validate the full handle immediately before DNS/HTTP without holding a network-time lock | No |
@@ -342,8 +423,8 @@ claims below require the deterministic PoC or a future real-backend compatibilit
 | Same-handle worker-rejection readback | Current runtime has no worker policy-rejection record | Not confirmed | Two completion transactions and conflict-safe PostgreSQL readback | Permit exact readback only for a matching worker rejection record | No |
 | Duplicate success completion | Current runtime has no `already-completed` outcome | Not confirmed | Concurrent same-handle success completion | Create at most one attempt; return `already-completed` without replaying the HTTP outcome | No |
 | Duplicate failure completion | Current runtime has no `already-completed` outcome | Not confirmed | Retryable and retry-exhausted concurrent completion | Apply one attempt/state transition; return `already-completed` without mutation | No |
-| `already-completed` outcome | Current runtime raises or follows existing state paths rather than exposing this internal result | Not confirmed | Locked same-handle post-completion classification | Distinguish accepted prior completion from stale ownership without promising ordinary outcome readback | No |
-| `stale-claim` outcome | Current runtime has no generation fence or stale outcome | Not confirmed | Recovery/reclaim and different-generation completion | Reject invalidated handles without mutation or cross-claim readback | No |
+| `already-completed` outcome | Current runtime raises or follows existing state paths rather than exposing this internal result | Pure model classifies a matching marker on non-processing state as `already-completed` | Locked same-handle PostgreSQL classification | Distinguish accepted prior completion from stale ownership without promising ordinary outcome readback | No |
+| `stale-claim` outcome | Current runtime has no generation fence or stale outcome | Pure model classifies unmarked recovery and older generation as stale | Recovery/reclaim with real row locks | Reject invalidated handles without mutation or cross-claim readback | No |
 | Delivery-attempt identity | Attempts have no claim-generation or completion identity | Not confirmed | Duplicate completion integration tests | Keep attempts unchanged; rely on the pre-insert full-handle fence | No |
 | Claim-to-completion budget | Current production has separate delivery and stale timeout values | Not confirmed | DB/pool/statement timeout enforcement and scheduling overhead | One 40-second monotonic budget: 10-second delivery cap plus 30-second margin | No |
 | Two-worker stale recovery | Recovery and claim are separate current transactions | Not confirmed | One long active delivery and a later eligible job remaining pending | Verify bounded ownership without claiming exactly-once guarantees | No |
@@ -400,11 +481,14 @@ recommendation for follow-up 1 and is not production-proven; real confirmation r
 row locks and at least two independent sessions.
 
 The current runtime also implements neither `already-completed` nor `stale-claim` as internal
-completion outcomes, and the transport PoC does not test completion idempotency. No PostgreSQL
-integration test exercised two completion transactions carrying the same or different handles.
-Worker policy-rejection readback, `already-completed`, and `stale-claim` therefore remain follow-up
-1 recommendations. Exact readback of an ordinary HTTP or `WebhookDeliveryAttempt` outcome is not
-a requirement of this spike.
+completion outcomes. The offline PoC's immutable, database-free model confirms only the ordered
+classification semantics: an accepted retry in `pending` with a matching marker is
+`already-completed`; recovered `pending` without that marker is `stale-claim`; and a newer
+generation fences an old handle. It also demonstrates that the marker contains no HTTP outcome.
+No PostgreSQL integration test exercised two completion transactions carrying the same or
+different handles, so locking, atomicity, worker-rejection readback, and production behavior remain
+follow-up 1 recommendations. Exact readback of an ordinary HTTP or `WebhookDeliveryAttempt`
+outcome is not a requirement of this spike.
 
 The PoC fake reports its peer through `get_extra_info("peername")`. The installed synchronous
 `httpcore2` `SyncStream` instead exposes the socket peer through
@@ -449,7 +533,8 @@ Exact command:
 ```
 
 The original spike result was `6 passed in 0.51s` (exit code 0). The corrective PoC now contains
-ten tests; its current result is recorded by the validation report rather than asserted here.
+15 offline deterministic tests; its current result is recorded by the validation report rather
+than asserted here.
 
 Confirmed through deterministic event ordering:
 
@@ -464,17 +549,23 @@ Confirmed through deterministic event ordering:
 - a fake resolver and every fake fallback dial consume one monotonic budget, later operations see
   only the remainder, and no third dial starts after exhaustion;
 - the default four-attempt cap permits exactly four failed approved dials and prevents a fifth;
-- raw answers above the default count proceed when deduplication leaves exactly eight unique
-  addresses, proving deduplication precedes the limit check;
+- 32 duplicate-heavy raw records stay within the raw cap and deduplicate to eight unique values;
+- record 33 stops resolver iteration and rejects duplicate-heavy input without validation, a
+  partial snapshot, dial, or write;
 - nine unique addresses exceed the default eight-address limit and fail closed before every dial;
+- shuffled, duplicate mixed-family answers produce exact IPv4/IPv6 round-robin ordering before the
+  four-attempt cap, resolve once, and never dial outside the approved snapshot;
+- the pure completion model distinguishes accepted retry scheduling from stale recovery, fences an
+  old handle after a newer claim, enforces pair nullability, and stores no HTTP outcome;
 - all deadline/limit cases keep one resolver call, use only the approved snapshot, and use no
-  sleep, system clock, DNS, or sockets.
+  sleep, system clock, DNS, sockets, database, ORM, real TLS, proxy, or HTTP/2.
 
 Unconfirmed by this offline PoC:
 
 - real DNS, sockets, OS routing, proxy implementations, and peer metadata;
 - real TLS CA/hostname failures, ALPN/HTTP2, and client certificates;
 - async behavior, concurrency, cancellation races, saturation, expiry, retries, and shutdown;
+- PostgreSQL row locks, transactional completion atomicity, and concurrent completion/recovery;
 - the production keepalive/reconnect policy. The PoC only proves reuse of its test stream; its
   hostname cache could reuse stale addresses after reconnect. Disabling keepalive gives the
   clearest per-request guard at a performance cost until per-connection ownership is proven.
@@ -677,14 +768,15 @@ does not change the public job status.
 
 All transitions out of a valid current `processing` claim clear `processing_started_at` and retain
 the last `claim_generation`: retry scheduling changes the job to `pending`, and successful or
-terminal completion changes it to `succeeded` or `dead_letter`. The field is not an indication
-that a job is currently processing. Current ownership always requires all of
+terminal completion changes it to `succeeded` or `dead_letter`. A retained `claim_generation` is
+not an indication that a job is currently processing. Current ownership always requires all of
 `status='processing'`, matching `delivery_cycle`, and matching `claim_generation`.
 
 The required concurrency outcomes are:
 
 1. If worker A returns after recovery but before another claim, the row is `pending`; A's
-   completion is stale and is rejected without mutation.
+   handle still matches current cycle/generation, but recovery did not write the last-completed
+   marker. Step 4 classifies A as stale and rejects it without mutation.
 2. If worker A returns after worker B has claimed the job, status is `processing` and the cycle may
    still match, but the generation differs; A's completion is stale and is rejected without an
    attempt or rejection.
@@ -699,7 +791,8 @@ The required concurrency outcomes are:
    generation, and the next claim increments `claim_generation` exactly once.
 7. Two completion calls carrying the same full handle serialize on the job row lock. The first
    validates the active processing claim, writes its single attempt or policy outcome, and changes
-   job state. The second performs no mutation. For a matching worker policy rejection it may read
+   job state while atomically writing the marker. The second matches that marker and performs no
+   mutation. For a matching worker policy rejection it may read
    back the same rejection outcome; for success, ordinary failure, retry scheduling, or retry
    exhaustion it returns `already-completed` without reconstructing the first HTTP or attempt
    outcome. A completion carrying an older or different generation returns `stale-claim` and may
@@ -723,11 +816,21 @@ payload.
 
 A migration is required.
 
+### Selected operational stale projection
+
+Recovery and internal stale classification use `processing_started_at`, never arbitrary
+`updated_at`. Follow-up 1 adds public `oldest_processing_started_at`. For at least one release it
+also preserves `oldest_processing_updated_at` as a deprecated compatibility alias. Both fields are
+populated from the exact same `MIN(processing_started_at)` query result and are both `NULL` when no
+processing jobs exist. Public documentation must state that the deprecated alias no longer means
+the oldest arbitrary job `updated_at`. The service query, schema, and API mapping cannot calculate
+the two fields independently, and their stale threshold must match recovery.
+
 ## Follow-up draft 1
 
 ### Follow-up 1 title
 
-Persist webhook destination-policy rejections and terminalize worker jobs
+Persist rejection/state contracts and fence webhook worker completion
 
 ### Follow-up 1 context
 
@@ -748,6 +851,13 @@ individual worker ownership period, including two claims in the same delivery cy
   `0`, enforce nonnegative values, and reject a claim at `9223372036854775807` before mutation with
   an internal overflow outcome. Never reset generation during retry, recovery, replay, or
   terminalization.
+- Add nullable `last_completed_delivery_cycle BIGINT` and
+  `last_completed_claim_generation BIGINT`, with a check constraint requiring both to be null or
+  both non-null. Backfill both to null without guessing historical completion. Legacy unmarked
+  duplicates fail closed as `stale-claim`. Atomically set both values under the completion row lock
+  for every accepted worker success, retryable-to-pending failure, retry-exhausted failure, and
+  worker policy rejection. Never set or change them from recovery, claim acquisition, scheduling
+  outside accepted completion, manual delivery/rejection, or advisory preflight.
 - Add nullable `processing_started_at`; backfill current processing rows from `updated_at`, leave
   all other rows null, and enforce non-null exactly for `status='processing'`. Move stale-recovery
   filters, ordering, and supporting indexes from `updated_at` to this field. Every transition out
@@ -814,6 +924,12 @@ individual worker ownership period, including two claims in the same delivery cy
   `attempt_count` in the same transaction. Any handle mismatch returns a stale-claim outcome and
   changes none of those fields or related records; it is not automatically retried and the batch
   continues.
+- Implement the exact four-step locked classification specified above: current cycle/generation
+  mismatch is stale before any newer-outcome read; a matching active processing handle may
+  complete; a matching non-processing handle plus matching completion marker is an accepted
+  duplicate; and a matching non-processing handle without that marker is recovered and stale.
+  Update the marker before or atomically with the completion's attempt/rejection, state transition,
+  processing timestamp clear, scheduling values, and terminal projection.
 - Do not add `claim_generation`, a completion key, or a new uniqueness constraint to
   `WebhookDeliveryAttempt` in this issue. The locked full-handle validation must occur before its
   single insert. Public or exact ordinary-attempt outcome readback remains a non-goal.
@@ -861,6 +977,15 @@ individual worker ownership period, including two claims in the same delivery cy
   record. A manual `422` may return opaque `rejection_id` and `manual_delivery_request_id`, while
   the public job status and terminal projection remain unchanged and no address, resolver message,
   or target detail is exposed.
+- Update `src/reliable_webhook_service/operations_service.py`,
+  `src/reliable_webhook_service/schemas.py`, and
+  `src/reliable_webhook_service/operations_api.py`, their focused tests, and public API
+  documentation. Recovery and internal stale classification use `processing_started_at`. Add
+  public `oldest_processing_started_at`; keep `oldest_processing_updated_at` as a deprecated
+  compatibility alias for at least one release. During that period both fields contain the same
+  minimum value computed exclusively from `processing_started_at`, including both being `NULL`
+  when no processing job exists. Document that the deprecated name no longer means arbitrary job
+  `updated_at`.
 - Treat the migration and handle-aware worker code as one coordinated deployment boundary. The
   rollout sequence is normative: stop and drain every old worker; verify that no old completion is
   in flight; apply the migration, backfill, indexes, and constraints during a maintenance window or
@@ -872,6 +997,12 @@ individual worker ownership period, including two claims in the same delivery cy
   start, depend on, or race an old worker completion; otherwise they are paused for the same
   maintenance window. This availability rule does not change manual outcome or transaction
   semantics.
+- Rolling compatibility requires a worker drain before activating the completion-marker contract:
+  no job-ID-only completion may remain in flight. Schema-first deployment may expose nullable
+  columns while old workers are stopped; only code that performs handle-aware claim, locked
+  classification, marker write, and marker-free recovery may resume. Old rows retain null markers
+  and unrecognized duplicates remain stale rather than guessed. Verify rollout with two-session
+  PostgreSQL row-lock tests and an executable drain/deployment check.
 - Emit a redacted log or metric for stale-claim and claim-overflow outcomes without target,
   resolver, address, or payload data.
 
@@ -898,6 +1029,12 @@ individual worker ownership period, including two claims in the same delivery cy
   recovery or after a new claim creates no attempt or policy rejection, changes no job/count/time
   or terminal field, is not automatically retried, and does not stop later batch jobs. The current
   worker with the matching handle can complete.
+- Completion markers satisfy pair nullability. Every accepted worker completion writes its exact
+  cycle/generation pair in the same locked transaction as all related persistence; recovery and
+  every non-worker-completion path leave it unchanged. A marked duplicate retry completion returns
+  `already-completed`, while an unmarked same-generation job recovered to pending returns
+  `stale-claim`. A newer generation and a replayed cycle both fence a historical marker. The pair
+  contains no HTTP outcome and ordinary attempts gain no outcome identity.
 - Initial and backfilled `delivery_cycle` is `0`; replay increments it once per successful
   terminal-to-pending transition, automatic retry never increments it, and row locking prevents a
   double increment under concurrent replay.
@@ -957,9 +1094,9 @@ individual worker ownership period, including two claims in the same delivery cy
   after manual records preserves them and does not reinterpret their cycle snapshots.
 - Stale recovery locks a processing row, confirms `processing_started_at` crosses the threshold,
   sets pending, clears the timestamp, and retains cycle, generation, and attempt count. A worker A
-  completion after recovery is rejected by status; after worker B's new claim it is rejected by
-  generation. Recovery racing A's completion serializes on the row lock and cannot create two
-  contradictory terminal results.
+  completion after recovery is rejected because the row is non-processing without A's marker;
+  after worker B's new claim it is rejected first by generation. Recovery racing A's completion
+  serializes on the row lock and cannot create two contradictory terminal results.
 - Worker rejection records persist the accepted generation. The terminal pointer resolves to the
   same worker record/job/cycle/generation, while manual records have null generation. Automatic
   retry and replay do not change generation before a claim; every future claim increments it.
@@ -969,6 +1106,10 @@ individual worker ownership period, including two claims in the same delivery cy
   once.
 - Migration and worker deployment are coordinated so an old job-ID-only worker cannot coexist with
   the new handle-aware claim and completion paths.
+- Operational stale projection is computed from `processing_started_at` only. The new
+  `oldest_processing_started_at` and deprecated `oldest_processing_updated_at` alias are equal for
+  at least one compatibility release, including equal `NULL` behavior, and use the same threshold
+  semantics as recovery.
 - Two concurrent worker policy-rejection completions carrying the same immutable
   `ClaimHandle(job_id, delivery_cycle, claim_generation)` create exactly one worker row and both
   return the same rejection ID and idempotent rejection outcome. Both outer transactions remain usable; neither creates an
@@ -985,6 +1126,30 @@ individual worker ownership period, including two claims in the same delivery cy
   and cannot read back an outcome belonging to the newer claim.
 
 ### Follow-up 1 tests
+
+The following are mandatory real PostgreSQL tests using two independent sessions where locking or
+concurrency is involved:
+
+1. **Accepted retry scheduling:** claim cycle `0`, generation `7`; accept retryable completion;
+   assert `pending`, marker `(0, 7)`, and exactly one attempt. Duplicate the same handle and assert
+   `already-completed`, the same job values, one attempt, and no additional mutation.
+2. **Recovery before completion:** claim cycle `0`, generation `7`; recovery sets `pending` without
+   a matching marker. Late completion returns `stale-claim`, creates zero attempts, and performs no
+   additional mutation.
+3. **Newer-claim fencing:** after accepted completion `(0, 7)`, the next claim increments generation
+   to `8`. Completion `(0, 7)` is stale, performs no mutation, and must not read back generation
+   `8`'s outcome.
+4. **Replay fencing:** retain a marker from cycle `0`, replay to cycle `1`, and assert old-cycle
+   completion is stale with no mutation.
+5. **Worker policy rejection:** after accepted rejection, the marker matches the handle; an exact
+   same-handle duplicate returns the same rejection record and creates no new rejection row.
+
+Add operations tests for the service query, public schema, and API mapping; assert both stale fields
+are identical, both are `NULL` without processing jobs, and their `processing_started_at` threshold
+matches recovery. Migration tests cover both nullable columns, pair-nullability DDL, null backfill,
+and fail-closed behavior for legacy unmarked rows. Two-session tests cover completion/recovery lock
+ordering and atomic marker visibility. Rollout tests cover worker drain and schema/code rolling
+compatibility.
 
 Migration/backfill and database-enforced source/nullability, PostgreSQL partial-unique-index DDL,
 composite-reference, and terminal-pointer constraint tests; initial cycle and exactly-once replay
@@ -1036,7 +1201,8 @@ expected API/manual-delivery maintenance behavior for the chosen migration proce
 
 ### Follow-up 1 documentation
 
-Update database, delivery execution, manual API, architecture, and changelog documentation.
+Update database, delivery execution, manual API, operations public API/schema compatibility,
+architecture, and changelog documentation.
 
 ### Follow-up 1 non-goals
 
@@ -1046,7 +1212,7 @@ worker execution, or exactly-once guarantee.
 ### Follow-up 1 validation commands
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -m pytest -W error -p no:cacheprovider tests/test_migrations.py tests/test_delivery_job_execution_service.py tests/test_delivery_processing_service.py tests/test_worker_iteration_service.py tests/test_worker_iteration_service_integration.py tests/test_delivery_service_transaction_integration.py tests/test_manual_delivery_api.py tests/test_delivery_job_recovery_service.py tests/test_replay_service.py
+& ".\.venv\Scripts\python.exe" -m pytest -W error -p no:cacheprovider tests/test_migrations.py tests/test_delivery_job_execution_service.py tests/test_delivery_processing_service.py tests/test_worker_iteration_service.py tests/test_worker_iteration_service_integration.py tests/test_delivery_service_transaction_integration.py tests/test_manual_delivery_api.py tests/test_delivery_job_recovery_service.py tests/test_replay_service.py tests/test_operations_service.py tests/test_operations_service_integration.py tests/test_operations_api.py tests/test_operations_api_integration.py
 & ".\.venv\Scripts\python.exe" -m ruff check migrations src tests
 & ".\.venv\Scripts\python.exe" -m mypy src
 ```
@@ -1074,13 +1240,21 @@ and peer inspection while retaining Host, SNI, and certificate verification.
   and embedded IPv4 in IPv4-mapped IPv6. Do not substitute an untested `is_global` check.
 - Reject URL userinfo and port `0`; allow ports `1..65535`, including non-default ports, under the
   same destination, deadline, proxy, and connection rules.
+- Reject before resolution or dial every IPv6 zone identifier (including bracketed `%zone` and
+  percent-encoded scope syntax such as `%25`), alternate integer/octal/hexadecimal/mixed-base or
+  shortened-dotted IPv4 form, and URL host with ambiguous parser normalization. Require one
+  canonical numeric representation, including explicit handling of IPv4-mapped, uppercase, and
+  non-canonical IPv6, so URL parser, policy classifier, and numeric dialer cannot disagree.
 - Implement `httpx2.BaseTransport` backed by
   `httpcore2.ConnectionPool(network_backend=...)`; never use `HTTPTransport._pool`.
 - Resolve once per new connection, validate all normalized answers, dial snapshot addresses only,
   restrict fallback, and verify peer before write.
-- Normalize, deterministically order, and deduplicate before enforcing 8-by-default/32-maximum
-  resolved addresses. Reject overflow rather than truncate. Enforce 4-by-default/8-maximum connect
-  attempts, never exceeding the address limit.
+- Count raw resolver records before normalization and reject the whole result on record 33,
+  including duplicate or invalid records, without continued iteration, partial snapshot, dial, or
+  write. For at most 32 raw records, normalize and validate, deduplicate, cap the approved snapshot
+  at 8 unique addresses, split and packed-byte-sort IPv4/IPv6 buckets, interleave one each in fixed
+  IPv4-then-IPv6 rounds, and only then cap connection attempts at 4. Keep the raw, unique, and
+  attempt caps independent.
 - Treat the existing 10-second `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` default as one monotonic budget
   across resolution, validation, every dial, TLS, request, and response. Pass only remaining time
   and start no operation at zero.
@@ -1112,8 +1286,10 @@ and peer inspection while retaining Host, SNI, and certificate verification.
 ### Follow-up 2 acceptance criteria
 
 - Denied/mixed answers reject durably before connection; no second lookup occurs.
-- Duplicate answers are removed before the address limit; overflow rejects without dial; connect
-  attempts never exceed their cap and use deterministic family/numeric ordering.
+- Raw record 33 rejects even when all records duplicate one allowed address. At most 32 records are
+  deduplicated before the unique limit; overflow rejects without dial. Connect attempts never
+  exceed four and use deterministic family interleaving, so both families occupy the first two
+  positions when both exist and neither family can starve the other.
 - Resolution, validation, all fallback, TLS, request, and response share one monotonic deadline;
   remaining budget decreases, and no dial starts after exhaustion. Errors are stable and redact
   resolved IPs and resolver detail.
@@ -1140,10 +1316,16 @@ and peer inspection while retaining Host, SNI, and certificate verification.
 
 ### Follow-up 2 tests
 
-Add table-driven tests for every normative IPv4/IPv6 class, mapped-address embedded classification,
-literal hosts, userinfo, port `0`, and non-default ports. Add deterministic fake-clock tests for
-one deadline across resolution and every fallback, address-count and connect-attempt limits, no
-dial after exhaustion, deterministic snapshot-only fallback, peer mismatch, TLS identity,
+Add table-driven fail-closed URL-host and numeric-normalization tests for every normative IPv4/IPv6
+class, IPv6 zone identifiers, bracketed IPv6 with `%zone`, percent-encoded scope syntax including
+`%25`, IPv4 integer/octal/hexadecimal forms, mixed-base IPv4 components, shortened dotted IPv4,
+IPv4-mapped IPv6, uppercase and non-canonical IPv6, ambiguous URL-parser normalization, literal
+hosts, userinfo, port `0`, and non-default ports. Assert rejection before resolution/dial/write and
+that parser, classifier, and dialer cannot disagree. Add deterministic fake-clock tests for one
+deadline across resolution and every fallback, exact 32-record duplicate-heavy acceptance,
+duplicate-heavy record-33 rejection with zero dial/write and no partial snapshot, the 8-unique and
+4-attempt caps, mixed-family shuffled/duplicate exact ordering and starvation prevention, no dial
+after exhaustion, deterministic snapshot-only fallback, peer mismatch, TLS identity,
 per-connection snapshot ownership, timeout/error mapping, typed-signal bypass, and proxy isolation.
 Add controlled real-transport tests for `server_addr`, peer-before-first-write, real TLS hostname
 verification, reconnect/expiry, HTTP/2 disabled behavior, HTTP/HTTPS/SOCKS rejection, and
@@ -1185,6 +1367,10 @@ persistence-owned pre-request/completion validation, just-in-time one-job claim,
 claim-budget boundary. It must declare and verify an exact compatible pair for both packages and
 lock public-seam and real-transport evidence into tests. The transport adapter must not own or
 mutate `claim_generation`. Blocks follow-up 3.
+
+Follow-up 1 must be deployed before follow-up 2: the transport worker needs executable locked
+completion fencing, including the durable marker distinction between accepted completion and stale
+recovery, before it begins a real outbound request.
 
 ## Follow-up draft 3
 
