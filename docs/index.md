@@ -23,6 +23,7 @@ Read the documentation in this order:
 5. [Operational endpoints](operations.md)
 6. [API documentation](api/index.md)
 7. [Changelog](../CHANGELOG.md)
+8. [Webhook SSRF boundary spike](design/0057-webhook-ssrf-boundary-spike.md)
 
 ## Documentation map
 
@@ -112,5 +113,6 @@ Read the documentation in this order:
 ## Navigation
 
 - [Architecture](architecture.md)
+- [Webhook SSRF boundary spike](design/0057-webhook-ssrf-boundary-spike.md)
 - [Changelog](../CHANGELOG.md)
 - [Project README](../README.md)
