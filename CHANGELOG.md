@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 1.0.1 - 2026-08-05
+
+### Delivery
+
+- Refactored internal webhook client error handling behind a compatible, transport-neutral timeout
+  and error contract while preserving delivery outcomes and persisted messages.
+
+### Security design
+
+- Completed and reviewed a design-only spike for an SSRF-safe DNS-to-connection delivery boundary.
+- Clarified that production webhook delivery does not implement this SSRF boundary; enforcement
+  remains deferred to follow-up implementation.
+
 ## 1.0.0 - 2026-07-28
 
 ### Ingestion and persistence
