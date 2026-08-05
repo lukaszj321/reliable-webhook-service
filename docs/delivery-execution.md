@@ -588,9 +588,14 @@ These errors occur before the HTTP request and do not create a delivery attempt.
 
 ## HTTP request behavior
 
-The service sends the event payload as JSON in a `POST` request to the endpoint's exact
-`target_url`. The caller supplies an explicit timeout, which must be positive and finite. Redirects
-are disabled with `follow_redirects=False`.
+The service sends the event payload as JSON in a `POST` request to the configured `target_url`.
+The caller supplies an explicit timeout, which must be positive and finite. Redirects are disabled
+with `follow_redirects=False`.
+
+Production delivery uses ordinary `httpx2.Client` instances and does not currently implement an
+SSRF-safe DNS-to-connection boundary. The completed and reviewed
+[webhook destination security spike](design/0057-webhook-ssrf-boundary-spike.md) documents the
+proposed design only; runtime enforcement is planned for a deferred follow-up implementation.
 
 Each execution performs exactly one request. It does not retry, and it does not read or persist the
 response body.

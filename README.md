@@ -122,6 +122,10 @@ See [API documentation](docs/api/index.md) for complete request, response, and e
   lease ownership, heartbeat, or automatic API-managed startup.
 - Authentication and authorization are not built in. Deployments should restrict application and
   operator endpoints at the network or gateway boundary.
+- Configured HTTP and HTTPS destination URLs are used for outbound delivery. Production delivery
+  does not currently enforce an SSRF-safe DNS-to-connection boundary. The completed and reviewed
+  [webhook destination security spike](docs/design/0057-webhook-ssrf-boundary-spike.md) is
+  design-only; runtime enforcement is deferred to follow-up implementation.
 - `/ready` checks PostgreSQL only. Operational endpoints do not check the worker, migration head,
   or downstream webhook targets, and their responses are point-in-time snapshots.
 
@@ -149,4 +153,5 @@ The full suite and Alembic checks require reachable PostgreSQL with current migr
 | [Delivery execution](docs/delivery-execution.md) | Delivery, retry, recovery, replay, and worker behavior |
 | [Operational endpoints](docs/operations.md) | Liveness, readiness, and aggregate queue inspection |
 | [API documentation](docs/api/index.md) | Public HTTP API reference |
+| [Webhook destination security spike](docs/design/0057-webhook-ssrf-boundary-spike.md) | Design-only SSRF boundary; runtime enforcement deferred |
 | [Changelog](CHANGELOG.md) | Release history and important limitations |

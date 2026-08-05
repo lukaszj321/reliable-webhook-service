@@ -74,6 +74,12 @@ The `target_url` field:
 - rejects unsupported schemes such as FTP;
 - may be normalized by Pydantic before it is stored.
 
+These rules are request and schema validation for the documented HTTP and HTTPS form only. They do
+not enforce a destination policy or a network-level SSRF boundary. The proposed boundary is
+documented in the design-only
+[webhook destination security spike](../design/0057-webhook-ssrf-boundary-spike.md); runtime
+enforcement is deferred to follow-up implementation.
+
 Invalid request data returns HTTP 422. Neither `name` nor `target_url` is required to be unique.
 The database schema does not define a unique constraint for either field.
 
